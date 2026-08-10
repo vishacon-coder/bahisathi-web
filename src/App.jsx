@@ -87,13 +87,20 @@ function fileToBase64(file) {
   });
 }
 
-async function extractBillViaApi(base64, mediaType) {
+async function extractBillViaApi(base64, mediaType, accessToken) {
   const res = await fetch(EXTRACT_API_URL, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${accessToken}` },
     body: JSON.stringify({ base64, mediaType }),
   });
-  if (!res.ok) throw new Error("Extraction failed");
+  if (!res.ok) {
+    let payload = null;
+    try { payload = await res.json(); } catch (e) {}
+    const err = new Error((payload && payload.message) || "Extraction failed");
+    err.code = payload && payload.error;
+    err.status = res.status;
+    throw err;
+  }
   return res.json();
 }
 
@@ -156,7 +163,103 @@ function Section({ children, style }) {
   return <div style={{ padding: "56px 28px", maxWidth: 920, margin: "0 auto", ...style }}>{children}</div>;
 }
 
-function Footer() {
+function LegalSection({ title, children }) {
+  return (
+    <div style={{ marginBottom: 26 }}>
+      <div style={{ fontFamily: display, fontSize: 19, fontWeight: 700, marginBottom: 8, color: C.text }}>{title}</div>
+      <div style={{ fontSize: 14, color: C.text, lineHeight: 1.7 }}>{children}</div>
+    </div>
+  );
+}
+
+function PrivacyPage() {
+  return (
+    <Section style={{ maxWidth: 760 }}>
+      <div style={{ fontFamily: display, fontSize: 32, fontWeight: 700, marginBottom: 4 }}>Privacy Policy</div>
+      <div style={{ fontSize: 13, color: C.textMuted, marginBottom: 28 }}>Effective 11 August 2026 · BahiSathi, a product of Tivaro LLP</div>
+
+      <LegalSection title="What we collect">
+        <p style={{ marginTop: 0 }}>When you use BahiSathi we collect: your email address and password (web accounts); your WhatsApp phone number (if you use the WhatsApp bot); the bill details extracted from photos you send us (vendor, date, GSTIN, amounts, category); and basic usage counts (how many bills you scan each month, used to apply free-plan limits).</p>
+        <p>We do <b>not</b> store the bill photos themselves. A photo is processed once to read its contents and is not saved on our servers.</p>
+      </LegalSection>
+
+      <LegalSection title="How your data is used">
+        <p style={{ marginTop: 0 }}>Your data is used only to run BahiSathi: keeping your ledger, showing your entries back to you, exporting them when you ask, applying plan limits, and improving reliability. We do not sell your data, and we do not use your ledger data for advertising.</p>
+      </LegalSection>
+
+      <LegalSection title="AI processing">
+        <p style={{ marginTop: 0 }}>Bill photos are read using Anthropic's Claude AI service. The image is sent securely to Anthropic's API for one-time processing and the extracted text is returned to us. Anthropic's API does not use customer data sent to it to train its models by default.</p>
+      </LegalSection>
+
+      <LegalSection title="Where your data lives">
+        <p style={{ marginTop: 0 }}>Ledger entries and account details are stored in our database hosted on Supabase (servers currently located on AWS in the Asia-Pacific region). Passwords are stored only as secure hashes. Each user's entries are isolated with row-level security, so one account can never read another account's data.</p>
+      </LegalSection>
+
+      <LegalSection title="Third-party services we rely on">
+        <p style={{ marginTop: 0 }}>Supabase (database and login), Anthropic (AI bill reading), Meta WhatsApp Business Platform (WhatsApp messages), and our hosting providers (Hostinger and Render). Each processes only what is needed for its function.</p>
+      </LegalSection>
+
+      <LegalSection title="Cookies and local storage">
+        <p style={{ marginTop: 0 }}>The website stores your login session in your browser's local storage so you stay signed in. We do not use advertising or tracking cookies.</p>
+      </LegalSection>
+
+      <LegalSection title="Your rights">
+        <p style={{ marginTop: 0 }}>You can ask us at any time to show you the data we hold about you, correct it, export it, or delete your account and all its entries. Write to <a href="mailto:hello@bahisathi.in" style={{ color: C.red }}>hello@bahisathi.in</a> and we will act within 30 days. These rights align with India's Digital Personal Data Protection Act, 2023.</p>
+      </LegalSection>
+
+      <LegalSection title="Grievances and changes">
+        <p style={{ marginTop: 0 }}>For any privacy concern, contact <a href="mailto:hello@bahisathi.in" style={{ color: C.red }}>hello@bahisathi.in</a>. If we make material changes to this policy we will post the updated version here with a new effective date.</p>
+      </LegalSection>
+    </Section>
+  );
+}
+
+function TermsPage() {
+  return (
+    <Section style={{ maxWidth: 760 }}>
+      <div style={{ fontFamily: display, fontSize: 32, fontWeight: 700, marginBottom: 4 }}>Terms of Service</div>
+      <div style={{ fontSize: 13, color: C.textMuted, marginBottom: 28 }}>Effective 11 August 2026 · BahiSathi, a product of Tivaro LLP</div>
+
+      <LegalSection title="The service">
+        <p style={{ marginTop: 0 }}>BahiSathi is an AI bookkeeping assistant: you send a photo of a bill on WhatsApp or the web, and BahiSathi extracts its details into a digital ledger you can review, edit, and export. By creating an account or messaging the bot you agree to these terms.</p>
+      </LegalSection>
+
+      <LegalSection title="Your account">
+        <p style={{ marginTop: 0 }}>You must be at least 18 and provide accurate information. Keep your password safe - you're responsible for activity on your account. One account is for one business/person unless we agree otherwise.</p>
+      </LegalSection>
+
+      <LegalSection title="Free plan and limits">
+        <p style={{ marginTop: 0 }}>The free plan currently includes 30 bill scans per calendar month per account (and per WhatsApp number), resetting on the 1st. Limits and plans may change; paid plans will be announced before any free feature is restricted. Fair use applies - automated or bulk abuse of the service may lead to suspension.</p>
+      </LegalSection>
+
+      <LegalSection title="Accuracy - please read">
+        <p style={{ marginTop: 0 }}>BahiSathi uses AI to read bills. AI can make mistakes, especially with handwriting or unclear photos - that's why every entry asks for your confirmation. <b>You are responsible for verifying entries before relying on them.</b> BahiSathi is a bookkeeping aid, not an accountant: it does not provide tax, legal, or financial advice, and its output does not replace your CA or your statutory obligations under GST or other laws.</p>
+      </LegalSection>
+
+      <LegalSection title="Acceptable use">
+        <p style={{ marginTop: 0 }}>Don't use BahiSathi for anything unlawful, don't upload content you have no right to share, don't attempt to break, overload, or reverse-engineer the service, and don't use it to process another person's data without their permission.</p>
+      </LegalSection>
+
+      <LegalSection title="Your data">
+        <p style={{ marginTop: 0 }}>Your ledger data belongs to you. You can export it at any time and request deletion of your account. How we handle data is described in our Privacy Policy, which is part of these terms.</p>
+      </LegalSection>
+
+      <LegalSection title="Liability">
+        <p style={{ marginTop: 0 }}>BahiSathi is provided "as is". To the maximum extent permitted by law, Tivaro LLP is not liable for indirect or consequential losses, or for losses arising from unverified AI-extracted entries, service interruptions, or third-party service failures. Our total liability for any claim is limited to the amount you paid us in the 12 months before the claim (or ₹1,000 if you're on the free plan).</p>
+      </LegalSection>
+
+      <LegalSection title="Termination and changes">
+        <p style={{ marginTop: 0 }}>You can stop using BahiSathi and delete your account at any time. We may suspend accounts that break these terms. We may update these terms; material changes will be posted here with a new effective date, and continued use means acceptance.</p>
+      </LegalSection>
+
+      <LegalSection title="Governing law and contact">
+        <p style={{ marginTop: 0 }}>These terms are governed by the laws of India, with courts of competent jurisdiction in India. Questions: <a href="mailto:hello@bahisathi.in" style={{ color: C.red }}>hello@bahisathi.in</a>.</p>
+      </LegalSection>
+    </Section>
+  );
+}
+
+function Footer({ setPage }) {
   const socials = [
     { label: "Instagram", href: "#" },
     { label: "LinkedIn", href: "#" },
@@ -187,8 +290,14 @@ function Footer() {
             ))}
           </div>
         </div>
-        <div style={{ borderTop: "1px solid #33476B", paddingTop: 16, color: "#8FA0BE", fontSize: 12 }}>
-          © 2026 <a href="https://tivaro.co.in/" target="_blank" rel="noopener noreferrer" style={{ color: "#C7CFDF", textDecoration: "underline" }}>Tivaro LLP</a> · BahiSathi · Made in India 🇮🇳
+        <div style={{ borderTop: "1px solid #33476B", paddingTop: 16, color: "#8FA0BE", fontSize: 12, display: "flex", justifyContent: "space-between", flexWrap: "wrap", gap: 10 }}>
+          <span>
+            © 2026 <a href="https://tivaro.co.in/" target="_blank" rel="noopener noreferrer" style={{ color: "#C7CFDF", textDecoration: "underline" }}>Tivaro LLP</a> · BahiSathi · Made in India 🇮🇳
+          </span>
+          <span style={{ display: "flex", gap: 14 }}>
+            <button onClick={() => setPage("privacy")} style={{ background: "transparent", border: "none", color: "#C7CFDF", fontSize: 12, cursor: "pointer", textDecoration: "underline", fontFamily: sans, padding: 0 }}>Privacy Policy</button>
+            <button onClick={() => setPage("terms")} style={{ background: "transparent", border: "none", color: "#C7CFDF", fontSize: 12, cursor: "pointer", textDecoration: "underline", fontFamily: sans, padding: 0 }}>Terms of Service</button>
+          </span>
         </div>
       </div>
     </div>
@@ -555,11 +664,17 @@ function ProductApp({ session, onLogout }) {
     setStep("processing");
     try {
       const base64 = await fileToBase64(file);
-      const extracted = await extractBillViaApi(base64, file.type || "image/jpeg");
+      const extracted = await extractBillViaApi(base64, file.type || "image/jpeg", session.access_token);
       setDraft({ ...extracted, items: extracted.items || [] });
       setStep("review");
     } catch (e) {
-      setError("Could not read this bill. Try a clearer photo.");
+      if (e.status === 429) {
+        setError(e.message || "You've used all your free scans for this month. Limit resets on the 1st - paid plans coming soon.");
+      } else if (e.status === 401) {
+        setError("Your session expired - please log out and log in again.");
+      } else {
+        setError("Could not read this bill. Try a clearer photo.");
+      }
       setStep("upload");
     } finally {
       setLoading(false);
@@ -751,6 +866,10 @@ export default function App() {
     setSession(stored ? JSON.parse(stored) : null);
   }, []);
 
+  useEffect(() => {
+    window.scrollTo(0, 0);
+  }, [page]);
+
   async function handleLogout() {
     if (session) await authSignOut(session.access_token);
     localStorage.removeItem("bahisathi_session");
@@ -771,6 +890,8 @@ export default function App() {
       {page === "home" && <HomePage setPage={setPage} />}
       {page === "features" && <FeaturesPage />}
       {page === "about" && <AboutPage setPage={setPage} />}
+      {page === "privacy" && <PrivacyPage />}
+      {page === "terms" && <TermsPage />}
       {page === "app" && (
         session === undefined ? (
           <Section style={{ textAlign: "center", color: C.textMuted }}>Loading…</Section>
@@ -780,7 +901,7 @@ export default function App() {
           <AuthGate onAuthed={(s) => setSession(s)} />
         )
       )}
-      <Footer />
+      <Footer setPage={setPage} />
     </div>
   );
 }
