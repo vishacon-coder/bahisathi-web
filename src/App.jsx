@@ -25,6 +25,37 @@ const display = "'Fraunces', serif";
 const sans = "'IBM Plex Sans', sans-serif";
 const mono = "'IBM Plex Mono', monospace";
 
+// Real flag artwork instead of the 🇮🇳 emoji — Windows has no glyph for
+// regional-indicator flag emoji and falls back to showing "IN" as text.
+function IndiaFlag({ size = 14, style = {} }) {
+  return (
+    <svg
+      width={size}
+      height={size * 0.667}
+      viewBox="0 0 900 600"
+      style={{ display: "inline-block", verticalAlign: "middle", borderRadius: 2, flex: "none", ...style }}
+      aria-label="India"
+    >
+      <rect width="900" height="200" y="0" fill="#FF9933" />
+      <rect width="900" height="200" y="200" fill="#FFFFFF" />
+      <rect width="900" height="200" y="400" fill="#138808" />
+      <circle cx="450" cy="300" r="80" fill="none" stroke="#000080" strokeWidth="4" />
+      <circle cx="450" cy="300" r="6" fill="#000080" />
+      {Array.from({ length: 24 }).map((_, i) => (
+        <line
+          key={i}
+          x1="450"
+          y1="300"
+          x2={450 + 80 * Math.cos((i * Math.PI) / 12)}
+          y2={300 + 80 * Math.sin((i * Math.PI) / 12)}
+          stroke="#000080"
+          strokeWidth="2"
+        />
+      ))}
+    </svg>
+  );
+}
+
 // ---------- Auth (plain REST calls to Supabase, real localStorage is fine
 // here since this is a normal deployed website, not a sandboxed artifact) ----------
 async function authSignUp(email, password) {
@@ -292,7 +323,7 @@ function Footer({ setPage }) {
         </div>
         <div style={{ borderTop: "1px solid #33476B", paddingTop: 16, color: "#8FA0BE", fontSize: 12, display: "flex", justifyContent: "space-between", flexWrap: "wrap", gap: 10 }}>
           <span>
-            © 2026 <a href="https://tivaro.co.in/" target="_blank" rel="noopener noreferrer" style={{ color: "#C7CFDF", textDecoration: "underline" }}>Tivaro LLP</a> · BahiSathi · Made in India 🇮🇳
+            © 2026 <a href="https://tivaro.co.in/" target="_blank" rel="noopener noreferrer" style={{ color: "#C7CFDF", textDecoration: "underline" }}>Tivaro LLP</a> · BahiSathi · Made in India <IndiaFlag size={14} style={{ marginLeft: 2, marginBottom: -1 }} />
           </span>
           <span style={{ display: "flex", gap: 14 }}>
             <button onClick={() => setPage("privacy")} style={{ background: "transparent", border: "none", color: "#C7CFDF", fontSize: 12, cursor: "pointer", textDecoration: "underline", fontFamily: sans, padding: 0 }}>Privacy Policy</button>
@@ -366,7 +397,7 @@ function HomePage({ setPage }) {
           <div style={{ display: "flex", gap: 48, flexWrap: "wrap", alignItems: "center" }}>
             <div style={{ flex: "1 1 400px" }}>
               <div style={{ display: "inline-flex", alignItems: "center", gap: 8, background: "#FBF4DF", border: `1px solid ${C.cardBorder}`, borderRadius: 20, padding: "6px 14px", fontSize: 12.5, fontWeight: 600, color: C.gold, marginBottom: 20 }}>
-                🇮🇳 AI bookkeeping for India's small businesses
+                <IndiaFlag size={15} /> AI bookkeeping for India's small businesses
               </div>
               <h1 style={{ fontFamily: display, fontWeight: 900, fontSize: "clamp(36px, 5.5vw, 56px)", lineHeight: 1.08, color: C.text, margin: 0 }}>
                 Your <span style={{ color: C.red }}>bahi khata</span>,<br />read by AI.
