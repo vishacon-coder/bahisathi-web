@@ -1061,7 +1061,9 @@ function ProductApp({ session, onLogout, setPage }) {
   const [dupConfirmed, setDupConfirmed] = useState(false);
   const [dragOver, setDragOver] = useState(false);
   const [businessProfile, setBusinessProfile] = useState(null);
+  const [savedBusinessProfile, setSavedBusinessProfile] = useState(null);
   const [businessLoaded, setBusinessLoaded] = useState(false);
+  const [businessEditing, setBusinessEditing] = useState(false);
   const [businessSaving, setBusinessSaving] = useState(false);
   const [businessError, setBusinessError] = useState(null);
   const [businessSaved, setBusinessSaved] = useState(false);
@@ -1103,15 +1105,22 @@ function ProductApp({ session, onLogout, setPage }) {
     (async () => {
       try {
         const profile = await businessProfileGet(session.access_token);
-        setBusinessProfile({
+        const loaded = {
           business_name: (profile && profile.business_name) || "",
           business_type: (profile && profile.business_type) || "",
           gstin: (profile && profile.gstin) || "",
           address: (profile && profile.address) || "",
-        });
+        };
+        setBusinessProfile(loaded);
+        setSavedBusinessProfile(loaded);
+        // Nothing saved yet - go straight to the form instead of an empty card.
+        setBusinessEditing(!(loaded.business_name || loaded.gstin));
       } catch (e) {
         console.error(e);
-        setBusinessProfile({ business_name: "", business_type: "", gstin: "", address: "" });
+        const empty = { business_name: "", business_type: "", gstin: "", address: "" };
+        setBusinessProfile(empty);
+        setSavedBusinessProfile(empty);
+        setBusinessEditing(true);
       }
       setBusinessLoaded(true);
     })();
@@ -1120,6 +1129,12 @@ function ProductApp({ session, onLogout, setPage }) {
   function updateBusinessField(field, value) {
     setBusinessProfile((p) => ({ ...p, [field]: value }));
     setBusinessSaved(false);
+  }
+
+  function cancelEditBusiness() {
+    setBusinessProfile(savedBusinessProfile);
+    setBusinessError(null);
+    setBusinessEditing(false);
   }
 
   async function saveBusinessProfile() {
@@ -1132,7 +1147,9 @@ function ProductApp({ session, onLogout, setPage }) {
         gstin: businessProfile.gstin || null,
         address: businessProfile.address || null,
       });
+      setSavedBusinessProfile(businessProfile);
       setBusinessSaved(true);
+      setBusinessEditing(false);
     } catch (e) {
       setBusinessError(e.message || "Could not save - please try again.");
     } finally {
@@ -1545,33 +1562,32 @@ function ProductApp({ session, onLogout, setPage }) {
               <div style={{ fontFamily: mono, fontSize: 18, color: C.ink }}>₹{monthTotal.toLocaleString("en-IN")}</div>
             </div>
 
-            {entries.length > 0 && (
-              <div style={{ background: C.white, border: `1px solid ${C.cardBorder}`, borderRadius: 6, padding: "14px 16px", marginBottom: 16 }}>
-                <div style={{ fontSize: 13, fontWeight: 600, color: C.text, marginBottom: 8 }}>Ask about your spending</div>
-                <div style={{ display: "flex", gap: 8 }}>
-                  <input
-                    value={askQuestion}
-                    onChange={(e) => setAskQuestion(e.target.value)}
-                    onKeyDown={(e) => { if (e.key === "Enter" && askQuestion.trim() && !askLoading) askAboutSpending(); }}
-                    placeholder={`is mahine kitna kharcha hua?`}
-                    style={{ flex: 1, border: `1px solid ${C.cardBorder}`, borderRadius: 6, padding: "9px 12px", fontSize: 13.5, background: C.white, color: C.text, outline: "none" }}
-                  />
-                  <button
-                    onClick={askAboutSpending}
-                    disabled={askLoading || !askQuestion.trim()}
-                    style={{ background: C.ink, color: C.white, border: "none", borderRadius: 6, padding: "9px 16px", fontSize: 13, fontWeight: 500, cursor: askLoading ? "default" : "pointer", opacity: askLoading || !askQuestion.trim() ? 0.7 : 1, whiteSpace: "nowrap" }}
-                  >
-                    {askLoading ? "Thinking…" : "Ask"}
-                  </button>
-                </div>
-                {askError && <div style={{ fontSize: 12.5, color: C.red, marginTop: 8 }}>{askError}</div>}
-                {askAnswer && (
-                  <div style={{ marginTop: 10, background: "#E7FFDB", border: "1px solid #BCE5A8", borderRadius: "10px 10px 10px 2px", padding: "10px 14px", fontSize: 13, color: "#1F2C1A", lineHeight: 1.55 }}>
-                    {askAnswer}
-                  </div>
-                )}
+            <div style={{ background: C.white, border: `1px solid ${C.cardBorder}`, borderRadius: 6, padding: "14px 16px", marginBottom: 16 }}>
+              <div style={{ fontSize: 13, fontWeight: 600, color: C.text, marginBottom: 8 }}>Ask BahiSathi</div>
+              <div style={{ display: "flex", gap: 8 }}>
+                <input
+                  value={askQuestion}
+                  onChange={(e) => setAskQuestion(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === "Enter" && askQuestion.trim() && !askLoading) askAboutSpending(); }}
+                  placeholder={entries.length > 0 ? "is mahine kitna kharcha hua?" : "how do I export to Excel?"}
+                  style={{ flex: 1, border: `1px solid ${C.cardBorder}`, borderRadius: 6, padding: "9px 12px", fontSize: 13.5, background: C.white, color: C.text, outline: "none" }}
+                />
+                <button
+                  onClick={askAboutSpending}
+                  disabled={askLoading || !askQuestion.trim()}
+                  style={{ background: C.ink, color: C.white, border: "none", borderRadius: 6, padding: "9px 16px", fontSize: 13, fontWeight: 500, cursor: askLoading ? "default" : "pointer", opacity: askLoading || !askQuestion.trim() ? 0.7 : 1, whiteSpace: "nowrap" }}
+                >
+                  {askLoading ? "Thinking…" : "Ask"}
+                </button>
               </div>
-            )}
+              <div style={{ fontSize: 11.5, color: C.textMuted, marginTop: 6 }}>About your spending, or how BahiSathi works - ask anything.</div>
+              {askError && <div style={{ fontSize: 12.5, color: C.red, marginTop: 8 }}>{askError}</div>}
+              {askAnswer && (
+                <div style={{ marginTop: 10, background: "#E7FFDB", border: "1px solid #BCE5A8", borderRadius: "10px 10px 10px 2px", padding: "10px 14px", fontSize: 13, color: "#1F2C1A", lineHeight: 1.55 }}>
+                  {askAnswer}
+                </div>
+              )}
+            </div>
 
             {entriesLoaded && entries.length === 0 && <div style={{ fontSize: 13.5, color: C.textMuted, padding: "24px 0" }}>No bills saved yet. Scan your first one.</div>}
             {entries.length > 0 && (
@@ -1781,7 +1797,34 @@ function ProductApp({ session, onLogout, setPage }) {
 
             {!businessLoaded && <div style={{ fontSize: 13.5, color: C.textMuted }}>Loading…</div>}
 
-            {businessLoaded && businessProfile && (
+            {businessLoaded && businessProfile && !businessEditing && (
+              <div style={{ background: C.white, border: `1px solid ${C.cardBorder}`, borderRadius: 8, padding: "18px 20px" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12, marginBottom: 14 }}>
+                  <div style={{ fontFamily: display, fontSize: 17, fontWeight: 600, color: C.text }}>
+                    {businessProfile.business_name || "No business name set"}
+                  </div>
+                  <button onClick={() => setBusinessEditing(true)} style={{ flexShrink: 0, background: "transparent", border: `1px solid ${C.cardBorder}`, color: C.ink, borderRadius: 6, padding: "6px 14px", fontSize: 12.5, fontWeight: 500, cursor: "pointer" }}>
+                    Edit
+                  </button>
+                </div>
+                <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", padding: "8px 0", borderBottom: `1px solid ${C.paperLine}`, fontSize: 13.5 }}>
+                    <span style={{ color: C.textMuted }}>Business type</span>
+                    <span style={{ color: C.text }}>{businessProfile.business_type ? BUSINESS_TYPE_LABELS[businessProfile.business_type] : "Not specified"}</span>
+                  </div>
+                  <div style={{ display: "flex", justifyContent: "space-between", padding: "8px 0", borderBottom: `1px solid ${C.paperLine}`, fontSize: 13.5 }}>
+                    <span style={{ color: C.textMuted }}>GSTIN</span>
+                    <span style={{ color: C.text, fontFamily: mono }}>{businessProfile.gstin || "Not set"}</span>
+                  </div>
+                  <div style={{ display: "flex", justifyContent: "space-between", padding: "8px 0", fontSize: 13.5, gap: 16 }}>
+                    <span style={{ color: C.textMuted, flexShrink: 0 }}>Address</span>
+                    <span style={{ color: C.text, textAlign: "right" }}>{businessProfile.address || "Not set"}</span>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {businessLoaded && businessProfile && businessEditing && (
               <div style={{ background: C.white, border: `1px solid ${C.cardBorder}`, borderRadius: 8, padding: "18px 20px" }}>
                 <div style={{ marginBottom: 12 }}>
                   <div style={{ fontSize: 12, color: C.textMuted, marginBottom: 5 }}>Business name</div>
@@ -1789,7 +1832,7 @@ function ProductApp({ session, onLogout, setPage }) {
                     value={businessProfile.business_name}
                     onChange={(e) => updateBusinessField("business_name", e.target.value)}
                     placeholder="e.g. Sharma Traders"
-                    style={{ width: "100%", border: `1px solid ${C.cardBorder}`, borderRadius: 6, padding: "9px 12px", fontSize: 13.5, background: C.white, color: C.text, outline: "none" }}
+                    style={{ display: "block", width: "100%", border: `1px solid ${C.cardBorder}`, borderRadius: 6, padding: "9px 12px", fontSize: 13.5, background: C.white, color: C.text, outline: "none" }}
                   />
                 </div>
                 <div style={{ marginBottom: 12 }}>
@@ -1797,7 +1840,7 @@ function ProductApp({ session, onLogout, setPage }) {
                   <select
                     value={businessProfile.business_type}
                     onChange={(e) => updateBusinessField("business_type", e.target.value)}
-                    style={{ width: "100%", border: `1px solid ${C.cardBorder}`, borderRadius: 6, padding: "9px 12px", fontSize: 13.5, background: C.white, color: C.text, outline: "none" }}
+                    style={{ display: "block", width: "100%", border: `1px solid ${C.cardBorder}`, borderRadius: 6, padding: "9px 12px", fontSize: 13.5, background: C.white, color: C.text, outline: "none" }}
                   >
                     <option value="">Not specified</option>
                     {BUSINESS_TYPE_KEYS.map((k) => (
@@ -1811,7 +1854,7 @@ function ProductApp({ session, onLogout, setPage }) {
                     value={businessProfile.gstin}
                     onChange={(e) => updateBusinessField("gstin", e.target.value.toUpperCase())}
                     placeholder="e.g. 27ABCDE1234F1Z5"
-                    style={{ width: "100%", border: `1px solid ${C.cardBorder}`, borderRadius: 6, padding: "9px 12px", fontSize: 13.5, fontFamily: mono, background: C.white, color: C.text, outline: "none" }}
+                    style={{ display: "block", width: "100%", border: `1px solid ${C.cardBorder}`, borderRadius: 6, padding: "9px 12px", fontSize: 13.5, fontFamily: mono, background: C.white, color: C.text, outline: "none" }}
                   />
                 </div>
                 <div style={{ marginBottom: 16 }}>
@@ -1821,7 +1864,7 @@ function ProductApp({ session, onLogout, setPage }) {
                     onChange={(e) => updateBusinessField("address", e.target.value)}
                     placeholder="Shop / office address"
                     rows={3}
-                    style={{ width: "100%", border: `1px solid ${C.cardBorder}`, borderRadius: 6, padding: "9px 12px", fontSize: 13.5, background: C.white, color: C.text, outline: "none", fontFamily: sans, resize: "vertical" }}
+                    style={{ display: "block", width: "100%", border: `1px solid ${C.cardBorder}`, borderRadius: 6, padding: "9px 12px", fontSize: 13.5, background: C.white, color: C.text, outline: "none", fontFamily: sans, resize: "vertical" }}
                   />
                 </div>
                 {businessError && <div style={{ fontSize: 12.5, color: C.red, marginBottom: 10 }}>{businessError}</div>}
@@ -1829,6 +1872,11 @@ function ProductApp({ session, onLogout, setPage }) {
                   <button onClick={saveBusinessProfile} disabled={businessSaving} style={{ background: C.green, color: C.white, border: "none", borderRadius: 6, padding: "10px 20px", fontSize: 13.5, fontWeight: 500, cursor: businessSaving ? "default" : "pointer", opacity: businessSaving ? 0.7 : 1 }}>
                     {businessSaving ? "Saving…" : "Save"}
                   </button>
+                  {savedBusinessProfile && (savedBusinessProfile.business_name || savedBusinessProfile.gstin) && (
+                    <button onClick={cancelEditBusiness} disabled={businessSaving} style={{ background: "transparent", color: C.textMuted, border: `1px solid ${C.cardBorder}`, borderRadius: 6, padding: "10px 16px", fontSize: 13.5, cursor: businessSaving ? "default" : "pointer" }}>
+                      Cancel
+                    </button>
+                  )}
                   {businessSaved && !businessSaving && <span style={{ fontSize: 12.5, color: C.green }}>Saved ✓</span>}
                 </div>
               </div>
@@ -1890,6 +1938,7 @@ export default function App() {
   return (
     <div style={{ fontFamily: sans, background: C.paper, color: C.text, minHeight: "100vh" }}>
       <style>{`
+        *, *::before, *::after { box-sizing: border-box; }
         .cta { transition: transform 0.15s ease, box-shadow 0.15s ease, filter 0.15s ease; }
         .cta:hover { transform: translateY(-2px); filter: brightness(1.06); }
         .navlink { transition: background 0.15s ease, color 0.15s ease; }
