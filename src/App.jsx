@@ -108,6 +108,50 @@ async function billsInsert(accessToken, row) {
   if (!res.ok) throw new Error(data.message || "Failed to save bill");
   return data[0];
 }
+async function billsUpdate(accessToken, id, patch) {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/bills?id=eq.${id}`, {
+    method: "PATCH",
+    headers: {
+      apikey: SUPABASE_PUBLISHABLE_KEY,
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+      Prefer: "return=representation",
+    },
+    body: JSON.stringify(patch),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error((data && data.message) || "Failed to update bill");
+  return data[0];
+}
+async function billsDelete(accessToken, id) {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/bills?id=eq.${id}`, {
+    method: "DELETE",
+    headers: { apikey: SUPABASE_PUBLISHABLE_KEY, Authorization: `Bearer ${accessToken}` },
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.message || "Failed to delete bill");
+  }
+}
+
+// Flags a likely-duplicate bill: same vendor (case/space-insensitive) and the
+// same total (within a rupee, to allow for rounding), regardless of date -
+// this is the common accident (re-scanning the same photo, or a bill sent on
+// both WhatsApp and the web before linking).
+function findPossibleDuplicate(draft, entries) {
+  if (!draft || !draft.vendor || draft.total == null) return null;
+  const vendor = String(draft.vendor).trim().toLowerCase();
+  const total = Number(draft.total);
+  if (!vendor || Number.isNaN(total)) return null;
+  return (
+    entries.find((e) => {
+      if (!e.vendor || e.total == null) return false;
+      const eVendor = String(e.vendor).trim().toLowerCase();
+      const eTotal = Number(e.total);
+      return eVendor === vendor && !Number.isNaN(eTotal) && Math.abs(eTotal - total) < 1;
+    }) || null
+  );
+}
 
 function fileToBase64(file) {
   return new Promise((resolve, reject) => {
@@ -902,6 +946,12 @@ function ProductApp({ session, onLogout, setPage }) {
   const [linkLoading, setLinkLoading] = useState(false);
   const [linkError, setLinkError] = useState(null);
   const [linkedNumbers, setLinkedNumbers] = useState([]);
+  const [editingId, setEditingId] = useState(null);
+  const [editDraft, setEditDraft] = useState(null);
+  const [savingEdit, setSavingEdit] = useState(false);
+  const [editError, setEditError] = useState(null);
+  const [deleteConfirmId, setDeleteConfirmId] = useState(null);
+  const [dupConfirmed, setDupConfirmed] = useState(false);
   const fileInputRef = useRef(null);
 
   useEffect(() => {
@@ -1043,9 +1093,15 @@ function ProductApp({ session, onLogout, setPage }) {
 
   function updateDraft(field, value) {
     setDraft((d) => ({ ...d, [field]: value }));
+    setDupConfirmed(false);
   }
 
   async function saveDraft() {
+    const dup = findPossibleDuplicate(draft, entries);
+    if (dup && !dupConfirmed) {
+      setDupConfirmed(true);
+      return;
+    }
     try {
       const saved = await billsInsert(session.access_token, {
         user_id: session.user.id,
@@ -1067,12 +1123,74 @@ function ProductApp({ session, onLogout, setPage }) {
       return;
     }
     setDraft(null);
+    setDupConfirmed(false);
     setStep("upload");
   }
 
   function discardDraft() {
     setDraft(null);
+    setDupConfirmed(false);
     setStep("upload");
+  }
+
+  function startEditEntry(entry) {
+    setDeleteConfirmId(null);
+    setEditError(null);
+    setEditingId(entry.id);
+    setEditDraft({ vendor: entry.vendor || "", date: entry.date || "", category: entry.category || "other", total: entry.total ?? "", cgst: entry.cgst ?? "", sgst: entry.sgst ?? "", igst: entry.igst ?? "" });
+  }
+
+  function cancelEditEntry() {
+    setEditingId(null);
+    setEditDraft(null);
+    setEditError(null);
+  }
+
+  function updateEditField(field, value) {
+    setEditDraft((d) => ({ ...d, [field]: value }));
+  }
+
+  async function saveEditEntry(id) {
+    setSavingEdit(true);
+    setEditError(null);
+    try {
+      const patch = {
+        vendor: editDraft.vendor,
+        bill_date: editDraft.date,
+        category: editDraft.category,
+        total: editDraft.total === "" ? null : Number(editDraft.total),
+        cgst: editDraft.cgst === "" ? null : Number(editDraft.cgst),
+        sgst: editDraft.sgst === "" ? null : Number(editDraft.sgst),
+        igst: editDraft.igst === "" ? null : Number(editDraft.igst),
+      };
+      const saved = await billsUpdate(session.access_token, id, patch);
+      setEntries((prev) => prev.map((e) => (e.id === id ? { ...e, vendor: saved.vendor, date: saved.bill_date, category: saved.category, total: saved.total, cgst: saved.cgst, sgst: saved.sgst, igst: saved.igst } : e)));
+      setEditingId(null);
+      setEditDraft(null);
+    } catch (e) {
+      setEditError(e.message || "Could not save changes - please try again.");
+    } finally {
+      setSavingEdit(false);
+    }
+  }
+
+  async function deleteEntry(id) {
+    if (deleteConfirmId !== id) {
+      setDeleteConfirmId(id);
+      return;
+    }
+    try {
+      await billsDelete(session.access_token, id);
+      setEntries((prev) => prev.filter((e) => e.id !== id));
+      if (editingId === id) {
+        setEditingId(null);
+        setEditDraft(null);
+      }
+    } catch (e) {
+      setEditError(e.message || "Could not delete this entry - please try again.");
+    } finally {
+      setDeleteConfirmId(null);
+    }
   }
 
   function exportToExcel() {
@@ -1156,6 +1274,15 @@ function ProductApp({ session, onLogout, setPage }) {
             {draft.vendor_source === "printed_unclear" && (
               <div style={{ fontSize: 12, color: C.amber, marginBottom: 10 }}>⚠️ Printed name was unclear - double-check this</div>
             )}
+            {(() => {
+              const dup = findPossibleDuplicate(draft, entries);
+              if (!dup) return null;
+              return (
+                <div style={{ background: "#FDECEC", border: `1px solid ${C.red}`, borderRadius: 6, padding: "10px 14px", fontSize: 12.5, marginBottom: 10, color: "#7A2323" }}>
+                  ⚠️ Possible duplicate — you already have ₹{Number(dup.total).toLocaleString("en-IN")} at {dup.vendor} {dup.date ? `on ${dup.date}` : ""} in your ledger. Saving again will add a second entry.
+                </div>
+              );
+            })()}
             <div style={{ background: C.white, border: `1px solid ${C.cardBorder}`, borderRadius: 6, position: "relative", paddingLeft: 22, overflow: "hidden" }}>
               <div style={{ position: "absolute", left: 14, top: 0, bottom: 0, width: 1.5, background: C.red, opacity: 0.55 }} />
               <div style={{ padding: "16px 18px 16px 6px" }}>
@@ -1179,8 +1306,8 @@ function ProductApp({ session, onLogout, setPage }) {
               </div>
             </div>
             <div style={{ display: "flex", gap: 10, marginTop: 16 }}>
-              <button onClick={saveDraft} style={{ flex: 1, background: C.green, color: C.white, border: "none", borderRadius: 6, padding: "11px 0", fontSize: 14, fontWeight: 500, cursor: "pointer" }}>
-                Save to ledger
+              <button onClick={saveDraft} style={{ flex: 1, background: dupConfirmed ? C.red : C.green, color: C.white, border: "none", borderRadius: 6, padding: "11px 0", fontSize: 14, fontWeight: 500, cursor: "pointer" }}>
+                {dupConfirmed ? "Yes, save anyway" : "Save to ledger"}
               </button>
               <button onClick={discardDraft} style={{ background: "transparent", color: C.red, border: `1px solid ${C.red}`, borderRadius: 6, padding: "11px 18px", fontSize: 14, cursor: "pointer" }}>
                 Discard
@@ -1200,16 +1327,55 @@ function ProductApp({ session, onLogout, setPage }) {
               <div style={{ background: C.white, border: `1px solid ${C.cardBorder}`, borderRadius: 6, position: "relative", paddingLeft: 22, overflow: "hidden" }}>
                 <div style={{ position: "absolute", left: 14, top: 0, bottom: 0, width: 1.5, background: C.red, opacity: 0.55 }} />
                 <div style={{ padding: "16px 18px 16px 6px" }}>
-                  {entries.slice().reverse().map((e, i) => (
-                    <div key={e.id || i} style={{ display: "flex", justifyContent: "space-between", padding: "9px 0", borderBottom: `1px solid ${C.paperLine}`, fontSize: 13.5 }}>
-                      <div style={{ color: C.textMuted, width: 78, flexShrink: 0 }}>{e.date || "—"}</div>
-                      <div style={{ flex: 1 }}>
-                        <div style={{ color: C.text }}>{e.vendor || "—"}</div>
-                        <div style={{ fontSize: 11, color: C.textMuted }}>{CATEGORY_LABELS[e.category] || e.category}</div>
+                  {entries.slice().reverse().map((e, i) => {
+                    const isEditing = editingId === e.id;
+                    if (isEditing) {
+                      return (
+                        <div key={e.id || i} style={{ padding: "12px 0", borderBottom: `1px solid ${C.paperLine}` }}>
+                          <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+                            <input value={editDraft.vendor} onChange={(ev) => updateEditField("vendor", ev.target.value)} placeholder="Vendor" style={{ flex: 1, border: `1px solid ${C.cardBorder}`, borderRadius: 6, padding: "7px 10px", fontSize: 13, background: C.paper, color: C.text, outline: "none" }} />
+                            <input value={editDraft.date} onChange={(ev) => updateEditField("date", ev.target.value)} placeholder="DD-MM-YYYY" style={{ width: 110, border: `1px solid ${C.cardBorder}`, borderRadius: 6, padding: "7px 10px", fontSize: 13, background: C.paper, color: C.text, outline: "none" }} />
+                          </div>
+                          <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+                            <select value={editDraft.category} onChange={(ev) => updateEditField("category", ev.target.value)} style={{ flex: 1, border: `1px solid ${C.cardBorder}`, borderRadius: 6, padding: "7px 10px", fontSize: 13, background: C.paper, color: C.text, outline: "none" }}>
+                              {CATEGORY_KEYS.map((k) => (
+                                <option key={k} value={k}>{CATEGORY_LABELS[k]}</option>
+                              ))}
+                            </select>
+                            <input value={editDraft.total} onChange={(ev) => updateEditField("total", ev.target.value)} placeholder="Total" style={{ width: 110, border: `1px solid ${C.cardBorder}`, borderRadius: 6, padding: "7px 10px", fontSize: 13, fontFamily: mono, background: C.paper, color: C.text, outline: "none" }} />
+                          </div>
+                          <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+                            <input value={editDraft.cgst} onChange={(ev) => updateEditField("cgst", ev.target.value)} placeholder="CGST" style={{ flex: 1, border: `1px solid ${C.cardBorder}`, borderRadius: 6, padding: "7px 10px", fontSize: 12.5, fontFamily: mono, background: C.paper, color: C.text, outline: "none" }} />
+                            <input value={editDraft.sgst} onChange={(ev) => updateEditField("sgst", ev.target.value)} placeholder="SGST" style={{ flex: 1, border: `1px solid ${C.cardBorder}`, borderRadius: 6, padding: "7px 10px", fontSize: 12.5, fontFamily: mono, background: C.paper, color: C.text, outline: "none" }} />
+                            <input value={editDraft.igst} onChange={(ev) => updateEditField("igst", ev.target.value)} placeholder="IGST" style={{ flex: 1, border: `1px solid ${C.cardBorder}`, borderRadius: 6, padding: "7px 10px", fontSize: 12.5, fontFamily: mono, background: C.paper, color: C.text, outline: "none" }} />
+                          </div>
+                          {editError && <div style={{ fontSize: 12, color: C.red, marginBottom: 8 }}>{editError}</div>}
+                          <div style={{ display: "flex", gap: 8 }}>
+                            <button onClick={() => saveEditEntry(e.id)} disabled={savingEdit} style={{ background: C.green, color: C.white, border: "none", borderRadius: 6, padding: "8px 16px", fontSize: 12.5, fontWeight: 500, cursor: savingEdit ? "default" : "pointer", opacity: savingEdit ? 0.7 : 1 }}>
+                              {savingEdit ? "Saving…" : "Save"}
+                            </button>
+                            <button onClick={cancelEditEntry} style={{ background: "transparent", color: C.textMuted, border: `1px solid ${C.cardBorder}`, borderRadius: 6, padding: "8px 14px", fontSize: 12.5, cursor: "pointer" }}>
+                              Cancel
+                            </button>
+                            <button onClick={() => deleteEntry(e.id)} style={{ marginLeft: "auto", background: deleteConfirmId === e.id ? C.red : "transparent", color: deleteConfirmId === e.id ? C.white : C.red, border: `1px solid ${C.red}`, borderRadius: 6, padding: "8px 14px", fontSize: 12.5, cursor: "pointer" }}>
+                              {deleteConfirmId === e.id ? "Confirm delete?" : "Delete"}
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    }
+                    return (
+                      <div key={e.id || i} onClick={() => startEditEntry(e)} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "9px 0", borderBottom: `1px solid ${C.paperLine}`, fontSize: 13.5, cursor: "pointer" }}>
+                        <div style={{ color: C.textMuted, width: 78, flexShrink: 0 }}>{e.date || "—"}</div>
+                        <div style={{ flex: 1 }}>
+                          <div style={{ color: C.text }}>{e.vendor || "—"}</div>
+                          <div style={{ fontSize: 11, color: C.textMuted }}>{CATEGORY_LABELS[e.category] || e.category}</div>
+                        </div>
+                        <div style={{ fontFamily: mono, color: C.ink, fontWeight: 500, marginRight: 10 }}>₹{Number(e.total || 0).toLocaleString("en-IN")}</div>
+                        <div style={{ fontSize: 13, color: C.textMuted }}>✏️</div>
                       </div>
-                      <div style={{ fontFamily: mono, color: C.ink, fontWeight: 500 }}>₹{Number(e.total || 0).toLocaleString("en-IN")}</div>
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
               </div>
             )}
