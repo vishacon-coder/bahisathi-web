@@ -78,6 +78,27 @@ async function authSignIn(email, password) {
   if (!res.ok) throw new Error(data.msg || data.error_description || "Login failed");
   return data;
 }
+async function authRefreshToken(refreshToken) {
+  const res = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=refresh_token`, {
+    method: "POST",
+    headers: { apikey: SUPABASE_PUBLISHABLE_KEY, "Content-Type": "application/json" },
+    body: JSON.stringify({ refresh_token: refreshToken }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.msg || data.error_description || "Session refresh failed");
+  return data;
+}
+// Reads the "exp" (expiry, unix seconds) claim out of a Supabase access
+// token so we know exactly when to refresh it - no need to guess a TTL.
+function parseJwtExp(token) {
+  try {
+    const payload = token.split(".")[1];
+    const json = JSON.parse(atob(payload.replace(/-/g, "+").replace(/_/g, "/")));
+    return json.exp || null;
+  } catch (e) {
+    return null;
+  }
+}
 async function authSignOut(accessToken) {
   try {
     await fetch(`${SUPABASE_URL}/auth/v1/logout`, {
@@ -220,6 +241,7 @@ async function apiCall(path, accessToken, body) {
 }
 
 const getSubscriptionStatus = (accessToken) => apiCall("/api/subscription-status", accessToken);
+const getSpendSummary = (accessToken, question) => apiCall("/api/spend-summary", accessToken, { question });
 const createProOrder = (accessToken, cycle) => apiCall("/api/create-order", accessToken, { cycle });
 const verifyProPayment = (accessToken, payload) => apiCall("/api/verify-payment", accessToken, payload);
 const startWhatsAppLink = (accessToken, phone) => apiCall("/api/whatsapp/link-start", accessToken, { phone });
@@ -828,12 +850,12 @@ const ABOUT_NOW = [
   ["🧾", "Bill photo → ledger entry", "Snap any bill - printed or handwritten - and the vendor, date, GST split, and total are read into your books automatically."],
   ["💬", "WhatsApp bot", "Send a bill photo on WhatsApp, confirm with one tap, done. No new app to learn."],
   ["🌐", "Web ledger", "A simple online khata at bahisathi.in - scan bills, review entries, and see your monthly total anywhere."],
+  ["📊", "AI spend summaries", "Ask \"is mahine kitna kharcha hua?\" on the web or WhatsApp and get a straight answer with category breakdowns."],
   ["📤", "Excel export", "One tap gives you a clean spreadsheet your CA or Tally workflow already understands."],
   ["✓", "Honest AI", "When a bill is unclear, BahiSathi flags it and asks - it never quietly guesses with your money."],
 ];
 const ABOUT_COMING = [
   ["🗣️", "More Indian languages", "Beyond Hindi and English - confirm bills and ask questions in the language you think in."],
-  ["📊", "Smart summaries", "Ask \"is mahine kitna kharcha hua?\" and get a straight answer with category breakdowns."],
   ["🔔", "GST filing reminders", "Deadline nudges with your numbers already totalled and ready."],
   ["🤝", "CA sharing", "Give your accountant live, read-only access - no more shoebox of bills at month end."],
 ];
@@ -1043,6 +1065,10 @@ function ProductApp({ session, onLogout, setPage }) {
   const [businessSaving, setBusinessSaving] = useState(false);
   const [businessError, setBusinessError] = useState(null);
   const [businessSaved, setBusinessSaved] = useState(false);
+  const [askQuestion, setAskQuestion] = useState("");
+  const [askAnswer, setAskAnswer] = useState(null);
+  const [askLoading, setAskLoading] = useState(false);
+  const [askError, setAskError] = useState(null);
   const fileInputRef = useRef(null);
 
   useEffect(() => {
@@ -1344,6 +1370,21 @@ function ProductApp({ session, onLogout, setPage }) {
     }
   }
 
+  async function askAboutSpending() {
+    if (!askQuestion.trim()) return;
+    setAskLoading(true);
+    setAskError(null);
+    setAskAnswer(null);
+    try {
+      const result = await getSpendSummary(session.access_token, askQuestion.trim());
+      setAskAnswer(result.answer);
+    } catch (e) {
+      setAskError(e.message || "Could not get an answer - please try again.");
+    } finally {
+      setAskLoading(false);
+    }
+  }
+
   function exportToExcel() {
     const rows = entries.map((e) => ({
       Date: e.date || "",
@@ -1503,6 +1544,35 @@ function ProductApp({ session, onLogout, setPage }) {
               <div style={{ fontFamily: display, fontSize: 19, fontWeight: 600 }}>This month</div>
               <div style={{ fontFamily: mono, fontSize: 18, color: C.ink }}>₹{monthTotal.toLocaleString("en-IN")}</div>
             </div>
+
+            {entries.length > 0 && (
+              <div style={{ background: C.white, border: `1px solid ${C.cardBorder}`, borderRadius: 6, padding: "14px 16px", marginBottom: 16 }}>
+                <div style={{ fontSize: 13, fontWeight: 600, color: C.text, marginBottom: 8 }}>Ask about your spending</div>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <input
+                    value={askQuestion}
+                    onChange={(e) => setAskQuestion(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === "Enter" && askQuestion.trim() && !askLoading) askAboutSpending(); }}
+                    placeholder={`is mahine kitna kharcha hua?`}
+                    style={{ flex: 1, border: `1px solid ${C.cardBorder}`, borderRadius: 6, padding: "9px 12px", fontSize: 13.5, background: C.white, color: C.text, outline: "none" }}
+                  />
+                  <button
+                    onClick={askAboutSpending}
+                    disabled={askLoading || !askQuestion.trim()}
+                    style={{ background: C.ink, color: C.white, border: "none", borderRadius: 6, padding: "9px 16px", fontSize: 13, fontWeight: 500, cursor: askLoading ? "default" : "pointer", opacity: askLoading || !askQuestion.trim() ? 0.7 : 1, whiteSpace: "nowrap" }}
+                  >
+                    {askLoading ? "Thinking…" : "Ask"}
+                  </button>
+                </div>
+                {askError && <div style={{ fontSize: 12.5, color: C.red, marginTop: 8 }}>{askError}</div>}
+                {askAnswer && (
+                  <div style={{ marginTop: 10, background: "#E7FFDB", border: "1px solid #BCE5A8", borderRadius: "10px 10px 10px 2px", padding: "10px 14px", fontSize: 13, color: "#1F2C1A", lineHeight: 1.55 }}>
+                    {askAnswer}
+                  </div>
+                )}
+              </div>
+            )}
+
             {entriesLoaded && entries.length === 0 && <div style={{ fontSize: 13.5, color: C.textMuted, padding: "24px 0" }}>No bills saved yet. Scan your first one.</div>}
             {entries.length > 0 && (
               <div style={{ background: C.white, border: `1px solid ${C.cardBorder}`, borderRadius: 6, position: "relative", paddingLeft: 22, overflow: "hidden" }}>
@@ -1786,6 +1856,30 @@ export default function App() {
   useEffect(() => {
     window.scrollTo(0, 0);
   }, [page]);
+
+  // Supabase access tokens expire after ~1hr. Without this, anyone actively
+  // using the app past that point starts seeing silent 401s ("session
+  // expired") mid-task. Schedule a refresh 5 minutes before the token's real
+  // expiry (from its own "exp" claim), and re-schedule after every refresh -
+  // if the token's already expired (e.g. tab was asleep), this fires almost
+  // immediately instead.
+  useEffect(() => {
+    if (!session || !session.refresh_token || !session.access_token) return;
+    const exp = parseJwtExp(session.access_token);
+    if (!exp) return;
+    const msUntilRefresh = Math.max(exp * 1000 - Date.now() - 5 * 60 * 1000, 5000);
+    const timer = setTimeout(async () => {
+      try {
+        const data = await authRefreshToken(session.refresh_token);
+        const refreshed = { access_token: data.access_token, refresh_token: data.refresh_token, user: data.user };
+        localStorage.setItem("bahisathi_session", JSON.stringify(refreshed));
+        setSession(refreshed);
+      } catch (e) {
+        console.error("Session refresh failed:", e);
+      }
+    }, msUntilRefresh);
+    return () => clearTimeout(timer);
+  }, [session]);
 
   async function handleLogout() {
     if (session) await authSignOut(session.access_token);
