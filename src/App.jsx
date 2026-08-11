@@ -151,6 +151,18 @@ async function apiCall(path, accessToken, body) {
 const getSubscriptionStatus = (accessToken) => apiCall("/api/subscription-status", accessToken);
 const createProOrder = (accessToken, cycle) => apiCall("/api/create-order", accessToken, { cycle });
 const verifyProPayment = (accessToken, payload) => apiCall("/api/verify-payment", accessToken, payload);
+const startWhatsAppLink = (accessToken, phone) => apiCall("/api/whatsapp/link-start", accessToken, { phone });
+const verifyWhatsAppLink = (accessToken, otp) => apiCall("/api/whatsapp/link-verify", accessToken, { otp });
+async function unlinkWhatsApp(accessToken, phone) {
+  const res = await fetch(`${API_BASE}/api/whatsapp/link`, {
+    method: "DELETE",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${accessToken}` },
+    body: JSON.stringify({ phone }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || "Request failed");
+  return data;
+}
 
 // Single source of truth for Pro pricing, shared by the public Plans page and
 // the in-app upgrade flow. Both prices are final and GST-inclusive.
@@ -884,6 +896,12 @@ function ProductApp({ session, onLogout, setPage }) {
   const [upgrading, setUpgrading] = useState(false);
   const [upgradeError, setUpgradeError] = useState(null);
   const [upgradeCycle, setUpgradeCycle] = useState("monthly");
+  const [linkPhone, setLinkPhone] = useState("");
+  const [linkOtp, setLinkOtp] = useState("");
+  const [linkStep, setLinkStep] = useState("idle"); // idle | otp_sent
+  const [linkLoading, setLinkLoading] = useState(false);
+  const [linkError, setLinkError] = useState(null);
+  const [linkedNumbers, setLinkedNumbers] = useState([]);
   const fileInputRef = useRef(null);
 
   useEffect(() => {
@@ -904,6 +922,7 @@ function ProductApp({ session, onLogout, setPage }) {
     try {
       const status = await getSubscriptionStatus(session.access_token);
       setSub(status);
+      setLinkedNumbers(status.linked_whatsapp || []);
     } catch (e) {
       console.error(e);
     }
@@ -912,6 +931,44 @@ function ProductApp({ session, onLogout, setPage }) {
   useEffect(() => {
     refreshSubscription();
   }, [session]);
+
+  async function sendLinkCode() {
+    setLinkError(null);
+    setLinkLoading(true);
+    try {
+      await startWhatsAppLink(session.access_token, linkPhone);
+      setLinkStep("otp_sent");
+    } catch (e) {
+      setLinkError(e.message || "Could not send the code - please try again.");
+    } finally {
+      setLinkLoading(false);
+    }
+  }
+
+  async function confirmLinkCode() {
+    setLinkError(null);
+    setLinkLoading(true);
+    try {
+      await verifyWhatsAppLink(session.access_token, linkOtp);
+      setLinkPhone("");
+      setLinkOtp("");
+      setLinkStep("idle");
+      await refreshSubscription();
+    } catch (e) {
+      setLinkError(e.message || "That code didn't work - please try again.");
+    } finally {
+      setLinkLoading(false);
+    }
+  }
+
+  async function removeLink(phone) {
+    try {
+      await unlinkWhatsApp(session.access_token, phone);
+      await refreshSubscription();
+    } catch (e) {
+      setLinkError(e.message || "Could not unlink - please try again.");
+    }
+  }
 
   async function startUpgrade(cycle) {
     setUpgradeError(null);
@@ -1218,6 +1275,64 @@ function ProductApp({ session, onLogout, setPage }) {
                 </div>
               </div>
             )}
+
+            <div style={{ background: C.white, border: `1px solid ${C.cardBorder}`, borderRadius: 8, padding: "18px 20px", marginTop: 18 }}>
+              <div style={{ fontSize: 14.5, fontWeight: 600, color: C.text, marginBottom: 4 }}>Link your WhatsApp number</div>
+              <div style={{ fontSize: 12.5, color: C.textMuted, marginBottom: 14, lineHeight: 1.5 }}>
+                Scan bills on WhatsApp and the web with one shared free-scan limit and one Pro subscription. Bills you've already sent on WhatsApp will move into this ledger too.
+              </div>
+
+              {linkedNumbers.length > 0 && (
+                <div style={{ marginBottom: 14 }}>
+                  {linkedNumbers.map((num) => (
+                    <div key={num} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "8px 12px", background: C.paper, borderRadius: 6, marginBottom: 6 }}>
+                      <span style={{ fontSize: 13, color: C.text, fontFamily: mono }}>+{num}</span>
+                      <button onClick={() => removeLink(num)} style={{ background: "transparent", border: "none", color: C.red, fontSize: 12, cursor: "pointer", textDecoration: "underline", fontFamily: sans }}>
+                        Unlink
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {linkStep === "idle" && (
+                <div style={{ display: "flex", gap: 8 }}>
+                  <input
+                    type="tel"
+                    placeholder="91XXXXXXXXXX"
+                    value={linkPhone}
+                    onChange={(e) => setLinkPhone(e.target.value)}
+                    style={{ flex: 1, border: `1px solid ${C.cardBorder}`, borderRadius: 6, padding: "9px 12px", fontSize: 13.5, background: C.white, color: C.text, outline: "none" }}
+                  />
+                  <button onClick={sendLinkCode} disabled={linkLoading || !linkPhone} style={{ background: C.ink, color: C.white, border: "none", borderRadius: 6, padding: "9px 16px", fontSize: 13, fontWeight: 500, cursor: linkLoading ? "default" : "pointer", opacity: linkLoading || !linkPhone ? 0.7 : 1, whiteSpace: "nowrap" }}>
+                    {linkLoading ? "Sending…" : "Send code"}
+                  </button>
+                </div>
+              )}
+
+              {linkStep === "otp_sent" && (
+                <div>
+                  <div style={{ fontSize: 12.5, color: C.textMuted, marginBottom: 8 }}>Enter the code sent to +{linkPhone} on WhatsApp.</div>
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <input
+                      type="text"
+                      placeholder="6-digit code"
+                      value={linkOtp}
+                      onChange={(e) => setLinkOtp(e.target.value)}
+                      style={{ flex: 1, border: `1px solid ${C.cardBorder}`, borderRadius: 6, padding: "9px 12px", fontSize: 13.5, background: C.white, color: C.text, outline: "none" }}
+                    />
+                    <button onClick={confirmLinkCode} disabled={linkLoading || !linkOtp} style={{ background: C.green, color: C.white, border: "none", borderRadius: 6, padding: "9px 16px", fontSize: 13, fontWeight: 500, cursor: linkLoading ? "default" : "pointer", opacity: linkLoading || !linkOtp ? 0.7 : 1, whiteSpace: "nowrap" }}>
+                      {linkLoading ? "Checking…" : "Verify"}
+                    </button>
+                  </div>
+                  <button onClick={() => { setLinkStep("idle"); setLinkOtp(""); setLinkError(null); }} style={{ marginTop: 8, background: "transparent", border: "none", color: C.inkLight, fontSize: 12, cursor: "pointer", textDecoration: "underline", fontFamily: sans, padding: 0 }}>
+                    Use a different number
+                  </button>
+                </div>
+              )}
+
+              {linkError && <div style={{ marginTop: 10, fontSize: 12.5, color: C.red }}>{linkError}</div>}
+            </div>
           </div>
         )}
       </div>
