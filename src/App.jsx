@@ -135,6 +135,46 @@ async function extractBillViaApi(base64, mediaType, accessToken) {
   return res.json();
 }
 
+const API_BASE = EXTRACT_API_URL.replace(/\/api\/extract-bill$/, "");
+
+async function apiCall(path, accessToken, body) {
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: body ? "POST" : "GET",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${accessToken}` },
+    ...(body ? { body: JSON.stringify(body) } : {}),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || "Request failed");
+  return data;
+}
+
+const getSubscriptionStatus = (accessToken) => apiCall("/api/subscription-status", accessToken);
+const createProOrder = (accessToken, cycle) => apiCall("/api/create-order", accessToken, { cycle });
+const verifyProPayment = (accessToken, payload) => apiCall("/api/verify-payment", accessToken, payload);
+
+// Single source of truth for Pro pricing, shared by the public Plans page and
+// the in-app upgrade flow. Both prices are final and GST-inclusive.
+const PRO_PRICING = {
+  monthly: { amount: "₹199", per: "/month", note: "Billed every month. Switch to annual anytime and save." },
+  annual: { amount: "₹1,990", per: "/year", note: "Works out to ~₹166/month — 2 months free versus paying monthly." },
+};
+
+// Loads the Razorpay Checkout script once and reuses it on later calls.
+let razorpayScriptPromise = null;
+function loadRazorpayScript() {
+  if (window.Razorpay) return Promise.resolve();
+  if (!razorpayScriptPromise) {
+    razorpayScriptPromise = new Promise((resolve, reject) => {
+      const script = document.createElement("script");
+      script.src = "https://checkout.razorpay.com/v1/checkout.js";
+      script.onload = resolve;
+      script.onerror = () => reject(new Error("Could not load payment gateway. Check your connection and try again."));
+      document.body.appendChild(script);
+    });
+  }
+  return razorpayScriptPromise;
+}
+
 const CATEGORY_KEYS = ["raw_materials", "utilities", "rent", "salaries", "transport", "office_supplies", "food", "other"];
 const CATEGORY_LABELS = {
   raw_materials: "Raw materials",
@@ -157,6 +197,7 @@ function NavBar({ page, setPage, loggedIn }) {
   const links = [
     ["home", "Home"],
     ["features", "Features"],
+    ["plans", "Plans"],
     ["about", "About"],
     ["app", loggedIn ? "My Ledger" : "Try it"],
   ];
@@ -192,6 +233,19 @@ function NavBar({ page, setPage, loggedIn }) {
 
 function Section({ children, style }) {
   return <div style={{ padding: "56px 28px", maxWidth: 920, margin: "0 auto", ...style }}>{children}</div>;
+}
+
+// Lightweight overlay used to show Terms/Privacy without losing in-progress
+// form state (the app has no URL routing, so navigating pages would do that).
+function Modal({ onClose, children }) {
+  return (
+    <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(20,25,40,0.55)", zIndex: 200, display: "flex", justifyContent: "center", padding: "40px 16px", overflowY: "auto" }}>
+      <div onClick={(e) => e.stopPropagation()} style={{ background: C.paper, borderRadius: 12, maxWidth: 760, width: "100%", height: "fit-content", position: "relative", boxShadow: "0 20px 60px rgba(0,0,0,0.4)" }}>
+        <button onClick={onClose} style={{ position: "absolute", top: 10, right: 12, background: "transparent", border: "none", fontSize: 26, lineHeight: 1, cursor: "pointer", color: C.textMuted }}>×</button>
+        {children}
+      </div>
+    </div>
+  );
 }
 
 function LegalSection({ title, children }) {
@@ -263,6 +317,13 @@ function TermsPage() {
         <p style={{ marginTop: 0 }}>The free plan currently includes 30 bill scans per calendar month per account (and per WhatsApp number), resetting on the 1st. Limits and plans may change; paid plans will be announced before any free feature is restricted. Fair use applies - automated or bulk abuse of the service may lead to suspension.</p>
       </LegalSection>
 
+      <LegalSection title="Subscription & billing (Pro plan)">
+        <p style={{ marginTop: 0 }}>Pro costs ₹199/month or ₹1,990/year, billed upfront for the period you choose. See our <b>Plans</b> page for full pricing and features. <b>These prices are inclusive of GST</b> - the amount shown is exactly what you pay, nothing is added at checkout.</p>
+        <p>Pro is a fixed-term purchase, not an auto-renewing subscription: we do not store your card and do not charge you again automatically. When your paid period ends, your account simply returns to the Free plan until you choose to renew from the Plan tab.</p>
+        <p>Because there's no recurring charge, "cancelling" just means not renewing - there's nothing to switch off. Payments already made are non-refundable, including if you stop using the service before your paid period ends.</p>
+        <p>We may change Pro pricing for future billing periods. Any change will be posted on the Plans page before it applies - it will never change the price of a period you've already paid for.</p>
+      </LegalSection>
+
       <LegalSection title="Accuracy - please read">
         <p style={{ marginTop: 0 }}>BahiSathi uses AI to read bills. AI can make mistakes, especially with handwriting or unclear photos - that's why every entry asks for your confirmation. <b>You are responsible for verifying entries before relying on them.</b> BahiSathi is a bookkeeping aid, not an accountant: it does not provide tax, legal, or financial advice, and its output does not replace your CA or your statutory obligations under GST or other laws.</p>
       </LegalSection>
@@ -292,10 +353,9 @@ function TermsPage() {
 
 function Footer({ setPage }) {
   const socials = [
-    { label: "Instagram", href: "#" },
-    { label: "LinkedIn", href: "#" },
-    { label: "X", href: "#" },
-    { label: "WhatsApp", href: "#" },
+    { label: "Facebook", href: "https://www.facebook.com/profile.php?id=61592587118534" },
+    { label: "Instagram", href: "https://www.instagram.com/bahisathi/" },
+    { label: "X", href: "https://x.com/bahisathi" },
     { label: "Email", href: "mailto:hello@bahisathi.in" },
   ];
   return (
@@ -315,7 +375,13 @@ function Footer({ setPage }) {
           </div>
           <div style={{ display: "flex", gap: 16, alignItems: "flex-start", flexWrap: "wrap" }}>
             {socials.map((s) => (
-              <a key={s.label} href={s.href} style={{ color: "#C7CFDF", fontSize: 12.5, textDecoration: "none", fontFamily: sans }}>
+              <a
+                key={s.label}
+                href={s.href}
+                target={s.href.startsWith("mailto:") ? undefined : "_blank"}
+                rel={s.href.startsWith("mailto:") ? undefined : "noopener noreferrer"}
+                style={{ color: "#C7CFDF", fontSize: 12.5, textDecoration: "none", fontFamily: sans }}
+              >
                 {s.label}
               </a>
             ))}
@@ -326,6 +392,7 @@ function Footer({ setPage }) {
             © 2026 <a href="https://tivaro.co.in/" target="_blank" rel="noopener noreferrer" style={{ color: "#C7CFDF", textDecoration: "underline" }}>Tivaro LLP</a> · BahiSathi · Made in India <IndiaFlag size={14} style={{ marginLeft: 2, marginBottom: -1 }} />
           </span>
           <span style={{ display: "flex", gap: 14 }}>
+            <button onClick={() => setPage("plans")} style={{ background: "transparent", border: "none", color: "#C7CFDF", fontSize: 12, cursor: "pointer", textDecoration: "underline", fontFamily: sans, padding: 0 }}>Plans & Pricing</button>
             <button onClick={() => setPage("privacy")} style={{ background: "transparent", border: "none", color: "#C7CFDF", fontSize: 12, cursor: "pointer", textDecoration: "underline", fontFamily: sans, padding: 0 }}>Privacy Policy</button>
             <button onClick={() => setPage("terms")} style={{ background: "transparent", border: "none", color: "#C7CFDF", fontSize: 12, cursor: "pointer", textDecoration: "underline", fontFamily: sans, padding: 0 }}>Terms of Service</button>
           </span>
@@ -511,6 +578,111 @@ function FeaturesPage() {
   );
 }
 
+const FREE_PLAN_FEATURES = [
+  "30 bill scans per month",
+  "Web app + WhatsApp bot",
+  "Hindi and English",
+  "Automatic GST (CGST/SGST) split",
+  "Excel export",
+  "Email support",
+];
+const PRO_PLAN_FEATURES = [
+  "Unlimited bill scans, web + WhatsApp",
+  "Everything in Free, no monthly cap",
+  "No waiting for the 1st of the month",
+  "Priority email support",
+];
+
+function PlanFeatureList({ items, color }) {
+  return (
+    <ul style={{ listStyle: "none", padding: 0, margin: "0 0 22px" }}>
+      {items.map((f) => (
+        <li key={f} style={{ display: "flex", alignItems: "flex-start", gap: 8, fontSize: 13.5, lineHeight: 1.6, marginBottom: 9, color }}>
+          <span style={{ flexShrink: 0 }}>✓</span>
+          <span>{f}</span>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+function PlansPage({ setPage }) {
+  const [cycle, setCycle] = useState("monthly");
+  const pro = PRO_PRICING[cycle];
+
+  return (
+    <Section>
+      <div style={{ textAlign: "center", marginBottom: 6 }}>
+        <div style={{ fontFamily: display, fontSize: 32, fontWeight: 700, color: C.text }}>Simple, transparent pricing</div>
+        <div style={{ fontSize: 14.5, color: C.textMuted, marginTop: 8, maxWidth: 520, marginLeft: "auto", marginRight: "auto" }}>
+          No sales calls, no custom quotes - every plan and price is right here. All prices shown are <b>inclusive of GST</b>.
+        </div>
+      </div>
+
+      <div style={{ display: "flex", justifyContent: "center", gap: 6, margin: "28px 0 34px" }}>
+        {[["monthly", "Monthly"], ["annual", "Annual · save ~17%"]].map(([key, label]) => (
+          <button
+            key={key}
+            onClick={() => setCycle(key)}
+            style={{ background: cycle === key ? C.ink : C.white, color: cycle === key ? C.white : C.text, border: `1px solid ${cycle === key ? C.ink : C.cardBorder}`, borderRadius: 20, padding: "9px 20px", fontSize: 13.5, fontWeight: 600, cursor: "pointer", fontFamily: sans }}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: 20, maxWidth: 700, margin: "0 auto" }}>
+        <div style={{ background: C.white, border: `1px solid ${C.cardBorder}`, borderRadius: 16, padding: "28px 26px" }}>
+          <div style={{ fontFamily: display, fontSize: 20, fontWeight: 700, color: C.text }}>Free</div>
+          <div style={{ fontSize: 13, color: C.textMuted, marginTop: 4, marginBottom: 18 }}>For trying BahiSathi out</div>
+          <div style={{ display: "flex", alignItems: "baseline", gap: 6 }}>
+            <span style={{ fontFamily: display, fontSize: 36, fontWeight: 700, color: C.ink }}>₹0</span>
+          </div>
+          <div style={{ fontSize: 12, color: C.textMuted, marginBottom: 22 }}>forever, no card needed</div>
+          <PlanFeatureList items={FREE_PLAN_FEATURES} color={C.text} />
+          <button className="cta" onClick={() => setPage("app")} style={{ width: "100%", background: "transparent", color: C.ink, border: `2px solid ${C.ink}`, borderRadius: 8, padding: "12px 0", fontSize: 14.5, fontFamily: sans, fontWeight: 600, cursor: "pointer" }}>
+            Start free →
+          </button>
+        </div>
+
+        <div style={{ background: `linear-gradient(135deg, ${C.ink}, #2A4570)`, borderRadius: 16, padding: "28px 26px", color: C.white, position: "relative", boxShadow: "0 18px 40px rgba(30,51,88,0.3)" }}>
+          <div style={{ position: "absolute", top: 20, right: 24, background: C.gold, color: C.white, fontSize: 10.5, fontWeight: 700, borderRadius: 20, padding: "3px 11px", letterSpacing: 0.3 }}>MOST POPULAR</div>
+          <div style={{ fontFamily: display, fontSize: 20, fontWeight: 700 }}>Pro</div>
+          <div style={{ fontSize: 13, color: "#C7CFDF", marginTop: 4, marginBottom: 18 }}>For shops that scan every day</div>
+          <div style={{ display: "flex", alignItems: "baseline", gap: 6 }}>
+            <span style={{ fontFamily: display, fontSize: 36, fontWeight: 700 }}>{pro.amount}</span>
+            <span style={{ fontSize: 13, color: "#C7CFDF" }}>{pro.per}</span>
+          </div>
+          <div style={{ fontSize: 12, color: "#C7CFDF", marginBottom: 22, lineHeight: 1.5 }}>{pro.note}</div>
+          <PlanFeatureList items={PRO_PLAN_FEATURES} color="#E7ECF7" />
+          <button className="cta" onClick={() => setPage("app")} style={{ width: "100%", background: C.gold, color: C.white, border: "none", borderRadius: 8, padding: "12px 0", fontSize: 14.5, fontFamily: sans, fontWeight: 700, cursor: "pointer" }}>
+            Get Pro →
+          </button>
+        </div>
+      </div>
+
+      <div style={{ marginTop: 46, maxWidth: 700, marginLeft: "auto", marginRight: "auto" }}>
+        <div style={{ fontFamily: display, fontSize: 19, fontWeight: 700, marginBottom: 12, color: C.text }}>Plan terms</div>
+        <ul style={{ fontSize: 13.5, color: C.textMuted, lineHeight: 1.85, paddingLeft: 18, margin: 0 }}>
+          <li>All prices shown are final and inclusive of GST - nothing extra is added at checkout.</li>
+          <li>Pro is billed upfront for the period you pick (monthly or annual) and does not auto-renew - you're charged again only when you choose to renew.</li>
+          <li>You can stop anytime; your Pro access simply continues until the period you already paid for ends.</li>
+          <li>Payments are non-refundable once processed.</li>
+          <li>Free plan scans reset on the 1st of every month.</li>
+          <li>We may change prices for future billing periods; any change will be posted here before it applies.</li>
+        </ul>
+        <div style={{ fontSize: 12.5, color: C.textMuted, marginTop: 16 }}>
+          Full details in our{" "}
+          <button onClick={() => setPage("terms")} style={{ background: "transparent", border: "none", padding: 0, color: C.red, textDecoration: "underline", cursor: "pointer", fontSize: 12.5, fontFamily: sans }}>
+            Terms of Service
+          </button>
+          .
+        </div>
+      </div>
+    </Section>
+  );
+}
+
 const ABOUT_NOW = [
   ["🧾", "Bill photo → ledger entry", "Snap any bill - printed or handwritten - and the vendor, date, GST split, and total are read into your books automatically."],
   ["💬", "WhatsApp bot", "Send a bill photo on WhatsApp, confirm with one tap, done. No new app to learn."],
@@ -610,8 +782,12 @@ function AuthGate({ onAuthed }) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [checkEmail, setCheckEmail] = useState(false);
+  const [agree, setAgree] = useState(false);
+  const [showTerms, setShowTerms] = useState(false);
+  const [showPrivacy, setShowPrivacy] = useState(false);
 
   async function handleSubmit() {
+    if (mode === "signup" && !agree) return;
     setLoading(true);
     setError(null);
     try {
@@ -652,20 +828,51 @@ function AuthGate({ onAuthed }) {
           onKeyDown={(e) => { if (e.key === "Enter" && email && password && !loading) handleSubmit(); }}
           style={{ border: `1px solid ${C.cardBorder}`, borderRadius: 6, padding: "10px 12px", fontSize: 14, background: C.white, color: C.text, outline: "none" }}
         />
+        {mode === "signup" && (
+          <label style={{ display: "flex", gap: 8, alignItems: "flex-start", cursor: "pointer" }}>
+            <input type="checkbox" checked={agree} onChange={(e) => setAgree(e.target.checked)} style={{ marginTop: 3, flexShrink: 0 }} />
+            <span style={{ fontSize: 12, color: C.textMuted, lineHeight: 1.5 }}>
+              I agree to the{" "}
+              <button type="button" onClick={() => setShowTerms(true)} style={{ background: "transparent", border: "none", padding: 0, color: C.red, textDecoration: "underline", cursor: "pointer", fontSize: 12, fontFamily: sans }}>
+                Terms of Service
+              </button>{" "}
+              and{" "}
+              <button type="button" onClick={() => setShowPrivacy(true)} style={{ background: "transparent", border: "none", padding: 0, color: C.red, textDecoration: "underline", cursor: "pointer", fontSize: 12, fontFamily: sans }}>
+                Privacy Policy
+              </button>
+              , including that Pro plan payments are GST-inclusive and non-refundable.
+            </span>
+          </label>
+        )}
         {error && <div style={{ color: C.red, fontSize: 12.5 }}>{error}</div>}
-        <button type="button" onClick={handleSubmit} disabled={loading || !email || !password} style={{ background: C.green, color: C.white, border: "none", borderRadius: 6, padding: "11px 0", fontSize: 14, fontWeight: 500, cursor: loading ? "default" : "pointer", opacity: loading || !email || !password ? 0.7 : 1 }}>
+        <button
+          type="button"
+          onClick={handleSubmit}
+          disabled={loading || !email || !password || (mode === "signup" && !agree)}
+          style={{ background: C.green, color: C.white, border: "none", borderRadius: 6, padding: "11px 0", fontSize: 14, fontWeight: 500, cursor: loading ? "default" : "pointer", opacity: loading || !email || !password || (mode === "signup" && !agree) ? 0.7 : 1 }}
+        >
           {mode === "login" ? "Log in" : "Create account"}
         </button>
       </div>
       <button onClick={() => setMode(mode === "login" ? "signup" : "login")} style={{ marginTop: 14, background: "transparent", border: "none", color: C.inkLight, fontSize: 12.5, cursor: "pointer", textDecoration: "underline" }}>
         {mode === "login" ? "New here? Create an account" : "Already have an account? Log in"}
       </button>
+      {showTerms && (
+        <Modal onClose={() => setShowTerms(false)}>
+          <TermsPage />
+        </Modal>
+      )}
+      {showPrivacy && (
+        <Modal onClose={() => setShowPrivacy(false)}>
+          <PrivacyPage />
+        </Modal>
+      )}
     </Section>
   );
 }
 
 // ---------- Main product (scan + ledger) ----------
-function ProductApp({ session, onLogout }) {
+function ProductApp({ session, onLogout, setPage }) {
   const [tab, setTab] = useState("scan");
   const [step, setStep] = useState("upload");
   const [loading, setLoading] = useState(false);
@@ -673,6 +880,10 @@ function ProductApp({ session, onLogout }) {
   const [draft, setDraft] = useState(null);
   const [entries, setEntries] = useState([]);
   const [entriesLoaded, setEntriesLoaded] = useState(false);
+  const [sub, setSub] = useState(null);
+  const [upgrading, setUpgrading] = useState(false);
+  const [upgradeError, setUpgradeError] = useState(null);
+  const [upgradeCycle, setUpgradeCycle] = useState("monthly");
   const fileInputRef = useRef(null);
 
   useEffect(() => {
@@ -688,6 +899,61 @@ function ProductApp({ session, onLogout }) {
       setEntriesLoaded(true);
     })();
   }, [session]);
+
+  async function refreshSubscription() {
+    try {
+      const status = await getSubscriptionStatus(session.access_token);
+      setSub(status);
+    } catch (e) {
+      console.error(e);
+    }
+  }
+
+  useEffect(() => {
+    refreshSubscription();
+  }, [session]);
+
+  async function startUpgrade(cycle) {
+    setUpgradeError(null);
+    setUpgrading(true);
+    try {
+      await loadRazorpayScript();
+      const order = await createProOrder(session.access_token, cycle);
+      const rzp = new window.Razorpay({
+        key: order.key_id,
+        amount: order.amount,
+        currency: order.currency,
+        order_id: order.order_id,
+        name: "BahiSathi",
+        description: `Pro plan — ${PRO_PRICING[cycle].amount}${PRO_PRICING[cycle].per}, unlimited scans (GST inclusive)`,
+        prefill: { email: session.user?.email || "" },
+        theme: { color: "#A63A3A" },
+        handler: async (response) => {
+          try {
+            const result = await verifyProPayment(session.access_token, {
+              razorpay_order_id: response.razorpay_order_id,
+              razorpay_payment_id: response.razorpay_payment_id,
+              razorpay_signature: response.razorpay_signature,
+            });
+            setSub({ plan: result.plan, status: "active", current_period_end: result.current_period_end, cycle: result.cycle });
+          } catch (e) {
+            setUpgradeError("Payment went through but activation failed - contact hello@bahisathi.in and we'll sort it out.");
+          } finally {
+            setUpgrading(false);
+          }
+        },
+        modal: { ondismiss: () => setUpgrading(false) },
+      });
+      rzp.on("payment.failed", () => {
+        setUpgradeError("Payment failed - please try again.");
+        setUpgrading(false);
+      });
+      rzp.open();
+    } catch (e) {
+      setUpgradeError(e.message || "Could not start payment - please try again.");
+      setUpgrading(false);
+    }
+  }
 
   async function processFile(file) {
     setError(null);
@@ -774,12 +1040,15 @@ function ProductApp({ session, onLogout }) {
   return (
     <div>
       <div style={{ display: "flex", background: C.ink, paddingLeft: 24, gap: 4, justifyContent: "space-between", alignItems: "center", paddingRight: 24 }}>
-        <div style={{ display: "flex", gap: 4 }}>
-          {["scan", "ledger"].map((key) => (
+        <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
+          {["scan", "ledger", "plan"].map((key) => (
             <button key={key} onClick={() => setTab(key)} style={{ background: tab === key ? C.paper : "transparent", color: tab === key ? C.ink : "#B9C3D6", border: "none", borderRadius: "8px 8px 0 0", padding: "9px 18px", fontSize: 13.5, fontWeight: 500, cursor: "pointer", fontFamily: sans }}>
-              {key === "scan" ? "Scan bill" : "Ledger"}
+              {key === "scan" ? "Scan bill" : key === "ledger" ? "Ledger" : "Plan"}
             </button>
           ))}
+          {sub?.plan === "pro" && (
+            <span style={{ background: C.gold, color: C.white, fontSize: 10.5, fontWeight: 600, borderRadius: 20, padding: "3px 10px", letterSpacing: 0.3 }}>PRO</span>
+          )}
         </div>
         <button onClick={onLogout} style={{ background: "transparent", border: "1px solid #5C6B87", color: "#B9C3D6", borderRadius: 20, padding: "5px 14px", fontSize: 12.5, cursor: "pointer", fontFamily: sans }}>
           Log out
@@ -796,7 +1065,18 @@ function ProductApp({ session, onLogout }) {
               <div style={{ fontSize: 14.5, fontWeight: 500, color: C.ink }}>Click to choose a photo</div>
             </div>
             <input ref={fileInputRef} type="file" accept="image/*" onChange={handleFileChange} style={{ display: "none" }} />
-            {error && <div style={{ marginTop: 14, color: C.red, fontSize: 13 }}>{error}</div>}
+            {error && (
+              <div style={{ marginTop: 14, color: C.red, fontSize: 13 }}>
+                {error}
+                {error.toLowerCase().includes("free scan") && (
+                  <div>
+                    <button onClick={() => setTab("plan")} style={{ marginTop: 8, background: C.gold, color: C.white, border: "none", borderRadius: 6, padding: "8px 16px", fontSize: 13, fontWeight: 500, cursor: "pointer" }}>
+                      Upgrade to Pro — ₹199/mo
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         )}
 
@@ -883,6 +1163,63 @@ function ProductApp({ session, onLogout }) {
             )}
           </div>
         )}
+
+        {tab === "plan" && (
+          <div>
+            <div style={{ fontFamily: display, fontSize: 19, fontWeight: 600, marginBottom: 18 }}>Your plan</div>
+
+            {sub === null && <div style={{ fontSize: 13.5, color: C.textMuted }}>Loading…</div>}
+
+            {sub && sub.plan === "pro" && (
+              <div style={{ background: "#FBF4DF", border: `1px solid ${C.gold}`, borderRadius: 8, padding: "20px 22px" }}>
+                <div style={{ fontFamily: display, fontSize: 17, fontWeight: 600, color: C.ink, marginBottom: 6 }}>You're on Pro ✨</div>
+                <div style={{ fontSize: 13.5, color: C.textMuted, lineHeight: 1.6 }}>
+                  Unlimited scans, every month.
+                  {sub.current_period_end && (
+                    <> Renews on {new Date(sub.current_period_end).toLocaleDateString("en-IN", { day: "numeric", month: "long", year: "numeric" })}.</>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {sub && sub.plan === "free" && (
+              <div>
+                <div style={{ background: C.white, border: `1px solid ${C.cardBorder}`, borderRadius: 8, padding: "18px 20px", marginBottom: 18 }}>
+                  <div style={{ fontSize: 13.5, color: C.text, fontWeight: 500, marginBottom: 4 }}>Free plan</div>
+                  <div style={{ fontSize: 13, color: C.textMuted }}>{sub.scans_used} / {sub.scans_limit} scans used this month</div>
+                </div>
+                <div style={{ background: "linear-gradient(135deg, #1E3358, #2E4A78)", borderRadius: 8, padding: "22px 24px", color: C.white }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12, flexWrap: "wrap" }}>
+                    <div style={{ fontFamily: display, fontSize: 20, fontWeight: 700 }}>
+                      Pro — {PRO_PRICING[upgradeCycle].amount}{PRO_PRICING[upgradeCycle].per}
+                    </div>
+                    <div style={{ display: "flex", gap: 4, background: "rgba(0,0,0,0.2)", borderRadius: 16, padding: 3 }}>
+                      {[["monthly", "Monthly"], ["annual", "Annual"]].map(([key, label]) => (
+                        <button
+                          key={key}
+                          onClick={() => setUpgradeCycle(key)}
+                          style={{ background: upgradeCycle === key ? C.gold : "transparent", color: C.white, border: "none", borderRadius: 14, padding: "5px 12px", fontSize: 11.5, fontWeight: 600, cursor: "pointer", fontFamily: sans }}
+                        >
+                          {label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                  <div style={{ fontSize: 13.5, color: "#C7CFDF", lineHeight: 1.7, margin: "10px 0 18px" }}>
+                    Unlimited bill scans on web and WhatsApp. No caps, no waiting for the 1st of the month. Price shown is inclusive of GST.
+                  </div>
+                  <button onClick={() => startUpgrade(upgradeCycle)} disabled={upgrading} style={{ background: C.gold, color: C.white, border: "none", borderRadius: 6, padding: "11px 22px", fontSize: 14, fontWeight: 600, cursor: upgrading ? "default" : "pointer", opacity: upgrading ? 0.7 : 1 }}>
+                    {upgrading ? "Opening checkout…" : `Upgrade to Pro — ${PRO_PRICING[upgradeCycle].amount}${PRO_PRICING[upgradeCycle].per}`}
+                  </button>
+                  {upgradeError && <div style={{ marginTop: 12, fontSize: 12.5, color: "#F3B8B8" }}>{upgradeError}</div>}
+                  <div style={{ fontSize: 11.5, color: "#9FADC7", marginTop: 12 }}>
+                    Non-refundable, does not auto-renew. Full terms on the <button onClick={() => setPage("plans")} style={{ background: "transparent", border: "none", padding: 0, color: "#C7CFDF", textDecoration: "underline", cursor: "pointer", fontSize: 11.5, fontFamily: sans }}>Plans page</button>.
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -920,6 +1257,7 @@ export default function App() {
       <NavBar page={page} setPage={setPage} loggedIn={!!session} />
       {page === "home" && <HomePage setPage={setPage} />}
       {page === "features" && <FeaturesPage />}
+      {page === "plans" && <PlansPage setPage={setPage} />}
       {page === "about" && <AboutPage setPage={setPage} />}
       {page === "privacy" && <PrivacyPage />}
       {page === "terms" && <TermsPage />}
@@ -927,7 +1265,7 @@ export default function App() {
         session === undefined ? (
           <Section style={{ textAlign: "center", color: C.textMuted }}>Loading…</Section>
         ) : session ? (
-          <ProductApp session={session} onLogout={handleLogout} />
+          <ProductApp session={session} onLogout={handleLogout} setPage={setPage} />
         ) : (
           <AuthGate onAuthed={(s) => setSession(s)} />
         )
