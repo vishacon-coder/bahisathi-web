@@ -134,6 +134,33 @@ async function billsDelete(accessToken, id) {
   }
 }
 
+// Business profile is optional (see Terms/Privacy) - collected after signup,
+// not required to use the app. Stored one row per user (user_id is the
+// primary key), so a save is just an upsert.
+async function businessProfileGet(accessToken) {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/business_profiles?select=*&limit=1`, {
+    headers: { apikey: SUPABASE_PUBLISHABLE_KEY, Authorization: `Bearer ${accessToken}` },
+  });
+  if (!res.ok) throw new Error("Failed to load business profile");
+  const data = await res.json();
+  return data[0] || null;
+}
+async function businessProfileSave(accessToken, userId, patch) {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/business_profiles`, {
+    method: "POST",
+    headers: {
+      apikey: SUPABASE_PUBLISHABLE_KEY,
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+      Prefer: "resolution=merge-duplicates,return=representation",
+    },
+    body: JSON.stringify({ user_id: userId, ...patch, updated_at: new Date().toISOString() }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error((data && data.message) || "Failed to save business profile");
+  return data[0];
+}
+
 // Flags a likely-duplicate bill: same vendor (case/space-insensitive) and the
 // same total (within a rupee, to allow for rounding), regardless of date -
 // this is the common accident (re-scanning the same photo, or a bill sent on
@@ -242,6 +269,16 @@ const CATEGORY_LABELS = {
   food: "Food",
   other: "Other",
   mixed: "Mixed",
+};
+
+const BUSINESS_TYPE_KEYS = ["retail", "wholesale", "service", "manufacturing", "trading", "other"];
+const BUSINESS_TYPE_LABELS = {
+  retail: "Retail / shop",
+  wholesale: "Wholesale / distributor",
+  service: "Service provider",
+  manufacturing: "Manufacturer",
+  trading: "Trader",
+  other: "Other",
 };
 
 // A bill's line items can span more than one expense head (e.g. hardware
@@ -1000,6 +1037,12 @@ function ProductApp({ session, onLogout, setPage }) {
   const [editError, setEditError] = useState(null);
   const [deleteConfirmId, setDeleteConfirmId] = useState(null);
   const [dupConfirmed, setDupConfirmed] = useState(false);
+  const [dragOver, setDragOver] = useState(false);
+  const [businessProfile, setBusinessProfile] = useState(null);
+  const [businessLoaded, setBusinessLoaded] = useState(false);
+  const [businessSaving, setBusinessSaving] = useState(false);
+  const [businessError, setBusinessError] = useState(null);
+  const [businessSaved, setBusinessSaved] = useState(false);
   const fileInputRef = useRef(null);
 
   useEffect(() => {
@@ -1029,6 +1072,47 @@ function ProductApp({ session, onLogout, setPage }) {
   useEffect(() => {
     refreshSubscription();
   }, [session]);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const profile = await businessProfileGet(session.access_token);
+        setBusinessProfile({
+          business_name: (profile && profile.business_name) || "",
+          business_type: (profile && profile.business_type) || "",
+          gstin: (profile && profile.gstin) || "",
+          address: (profile && profile.address) || "",
+        });
+      } catch (e) {
+        console.error(e);
+        setBusinessProfile({ business_name: "", business_type: "", gstin: "", address: "" });
+      }
+      setBusinessLoaded(true);
+    })();
+  }, [session]);
+
+  function updateBusinessField(field, value) {
+    setBusinessProfile((p) => ({ ...p, [field]: value }));
+    setBusinessSaved(false);
+  }
+
+  async function saveBusinessProfile() {
+    setBusinessSaving(true);
+    setBusinessError(null);
+    try {
+      await businessProfileSave(session.access_token, session.user.id, {
+        business_name: businessProfile.business_name || null,
+        business_type: businessProfile.business_type || null,
+        gstin: businessProfile.gstin || null,
+        address: businessProfile.address || null,
+      });
+      setBusinessSaved(true);
+    } catch (e) {
+      setBusinessError(e.message || "Could not save - please try again.");
+    } finally {
+      setBusinessSaving(false);
+    }
+  }
 
   async function sendLinkCode() {
     setLinkError(null);
@@ -1137,6 +1221,23 @@ function ProductApp({ session, onLogout, setPage }) {
     const file = e.target.files && e.target.files[0];
     if (file) processFile(file);
     e.target.value = "";
+  }
+
+  function handleDragOver(e) {
+    e.preventDefault();
+    setDragOver(true);
+  }
+
+  function handleDragLeave(e) {
+    e.preventDefault();
+    setDragOver(false);
+  }
+
+  function handleDrop(e) {
+    e.preventDefault();
+    setDragOver(false);
+    const file = e.dataTransfer.files && e.dataTransfer.files[0];
+    if (file && file.type.startsWith("image/")) processFile(file);
   }
 
   function updateDraft(field, value) {
@@ -1258,8 +1359,20 @@ function ProductApp({ session, onLogout, setPage }) {
           ? e.items.map((it) => `${it.description || "item"} (₹${it.amount ?? "?"}, ${CATEGORY_LABELS[it.category] || it.category || "other"})`).join("; ")
           : "",
     }));
-    const ws = XLSX.utils.json_to_sheet(rows);
     const wb = XLSX.utils.book_new();
+    let ws;
+    if (businessProfile && (businessProfile.business_name || businessProfile.gstin)) {
+      const headerRows = [
+        [businessProfile.business_name || "BahiSathi Ledger"],
+        ...(businessProfile.gstin ? [[`GSTIN: ${businessProfile.gstin}`]] : []),
+        ...(businessProfile.address ? [[businessProfile.address]] : []),
+        [],
+      ];
+      ws = XLSX.utils.aoa_to_sheet(headerRows);
+      XLSX.utils.sheet_add_json(ws, rows, { origin: -1 });
+    } else {
+      ws = XLSX.utils.json_to_sheet(rows);
+    }
     XLSX.utils.book_append_sheet(wb, ws, "Ledger");
     XLSX.writeFile(wb, "bahisathi-ledger.xlsx");
   }
@@ -1270,9 +1383,9 @@ function ProductApp({ session, onLogout, setPage }) {
     <div>
       <div style={{ display: "flex", background: C.ink, paddingLeft: 24, gap: 4, justifyContent: "space-between", alignItems: "center", paddingRight: 24 }}>
         <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
-          {["scan", "ledger", "plan"].map((key) => (
+          {["scan", "ledger", "plan", "business"].map((key) => (
             <button key={key} onClick={() => setTab(key)} style={{ background: tab === key ? C.paper : "transparent", color: tab === key ? C.ink : "#B9C3D6", border: "none", borderRadius: "8px 8px 0 0", padding: "9px 18px", fontSize: 13.5, fontWeight: 500, cursor: "pointer", fontFamily: sans }}>
-              {key === "scan" ? "Scan bill" : key === "ledger" ? "Ledger" : "Plan"}
+              {key === "scan" ? "Scan bill" : key === "ledger" ? "Ledger" : key === "plan" ? "Plan" : "Business"}
             </button>
           ))}
           {sub?.plan === "pro" && (
@@ -1289,9 +1402,15 @@ function ProductApp({ session, onLogout, setPage }) {
           <div>
             <div style={{ fontFamily: display, fontSize: 19, fontWeight: 600, marginBottom: 4 }}>Snap or upload a bill</div>
             <div style={{ fontSize: 13, color: C.textMuted, marginBottom: 18 }}>Photo of any invoice, receipt, or bill</div>
-            <div onClick={() => fileInputRef.current && fileInputRef.current.click()} style={{ border: `2px dashed ${C.gold}`, borderRadius: 8, padding: "44px 20px", textAlign: "center", cursor: "pointer", background: C.white }}>
+            <div
+              onClick={() => fileInputRef.current && fileInputRef.current.click()}
+              onDragOver={handleDragOver}
+              onDragLeave={handleDragLeave}
+              onDrop={handleDrop}
+              style={{ border: `2px dashed ${C.gold}`, borderRadius: 8, padding: "44px 20px", textAlign: "center", cursor: "pointer", background: dragOver ? "#FDF3DC" : C.white, transition: "background 0.15s" }}
+            >
               <div style={{ fontSize: 32, marginBottom: 10 }}>🧾</div>
-              <div style={{ fontSize: 14.5, fontWeight: 500, color: C.ink }}>Click to choose a photo</div>
+              <div style={{ fontSize: 14.5, fontWeight: 500, color: C.ink }}>{dragOver ? "Drop to upload" : "Click to choose a photo, or drag and drop it here"}</div>
             </div>
             <input ref={fileInputRef} type="file" accept="image/*" onChange={handleFileChange} style={{ display: "none" }} />
             {error && (
@@ -1579,6 +1698,74 @@ function ProductApp({ session, onLogout, setPage }) {
               )}
 
               {linkError && <div style={{ marginTop: 10, fontSize: 12.5, color: C.red }}>{linkError}</div>}
+            </div>
+          </div>
+        )}
+
+        {tab === "business" && (
+          <div>
+            <div style={{ fontFamily: display, fontSize: 19, fontWeight: 600, marginBottom: 4 }}>Business details</div>
+            <div style={{ fontSize: 13, color: C.textMuted, marginBottom: 18, lineHeight: 1.5 }}>
+              Optional - not needed to scan bills or use your ledger. Fill this in if you want your business name and GSTIN to appear on your Excel exports and, later, on GST-ready reports.
+            </div>
+
+            {!businessLoaded && <div style={{ fontSize: 13.5, color: C.textMuted }}>Loading…</div>}
+
+            {businessLoaded && businessProfile && (
+              <div style={{ background: C.white, border: `1px solid ${C.cardBorder}`, borderRadius: 8, padding: "18px 20px" }}>
+                <div style={{ marginBottom: 12 }}>
+                  <div style={{ fontSize: 12, color: C.textMuted, marginBottom: 5 }}>Business name</div>
+                  <input
+                    value={businessProfile.business_name}
+                    onChange={(e) => updateBusinessField("business_name", e.target.value)}
+                    placeholder="e.g. Sharma Traders"
+                    style={{ width: "100%", border: `1px solid ${C.cardBorder}`, borderRadius: 6, padding: "9px 12px", fontSize: 13.5, background: C.white, color: C.text, outline: "none" }}
+                  />
+                </div>
+                <div style={{ marginBottom: 12 }}>
+                  <div style={{ fontSize: 12, color: C.textMuted, marginBottom: 5 }}>Business type</div>
+                  <select
+                    value={businessProfile.business_type}
+                    onChange={(e) => updateBusinessField("business_type", e.target.value)}
+                    style={{ width: "100%", border: `1px solid ${C.cardBorder}`, borderRadius: 6, padding: "9px 12px", fontSize: 13.5, background: C.white, color: C.text, outline: "none" }}
+                  >
+                    <option value="">Not specified</option>
+                    {BUSINESS_TYPE_KEYS.map((k) => (
+                      <option key={k} value={k}>{BUSINESS_TYPE_LABELS[k]}</option>
+                    ))}
+                  </select>
+                </div>
+                <div style={{ marginBottom: 12 }}>
+                  <div style={{ fontSize: 12, color: C.textMuted, marginBottom: 5 }}>GSTIN</div>
+                  <input
+                    value={businessProfile.gstin}
+                    onChange={(e) => updateBusinessField("gstin", e.target.value.toUpperCase())}
+                    placeholder="e.g. 27ABCDE1234F1Z5"
+                    style={{ width: "100%", border: `1px solid ${C.cardBorder}`, borderRadius: 6, padding: "9px 12px", fontSize: 13.5, fontFamily: mono, background: C.white, color: C.text, outline: "none" }}
+                  />
+                </div>
+                <div style={{ marginBottom: 16 }}>
+                  <div style={{ fontSize: 12, color: C.textMuted, marginBottom: 5 }}>Address</div>
+                  <textarea
+                    value={businessProfile.address}
+                    onChange={(e) => updateBusinessField("address", e.target.value)}
+                    placeholder="Shop / office address"
+                    rows={3}
+                    style={{ width: "100%", border: `1px solid ${C.cardBorder}`, borderRadius: 6, padding: "9px 12px", fontSize: 13.5, background: C.white, color: C.text, outline: "none", fontFamily: sans, resize: "vertical" }}
+                  />
+                </div>
+                {businessError && <div style={{ fontSize: 12.5, color: C.red, marginBottom: 10 }}>{businessError}</div>}
+                <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                  <button onClick={saveBusinessProfile} disabled={businessSaving} style={{ background: C.green, color: C.white, border: "none", borderRadius: 6, padding: "10px 20px", fontSize: 13.5, fontWeight: 500, cursor: businessSaving ? "default" : "pointer", opacity: businessSaving ? 0.7 : 1 }}>
+                    {businessSaving ? "Saving…" : "Save"}
+                  </button>
+                  {businessSaved && !businessSaving && <span style={{ fontSize: 12.5, color: C.green }}>Saved ✓</span>}
+                </div>
+              </div>
+            )}
+
+            <div style={{ fontSize: 11.5, color: C.textMuted, marginTop: 14, lineHeight: 1.5 }}>
+              No company ID or GST verification is required to use BahiSathi - these details are only used to label your own exports.
             </div>
           </div>
         )}
