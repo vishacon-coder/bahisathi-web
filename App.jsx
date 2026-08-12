@@ -647,6 +647,31 @@ async function dailyClosingUpsert(accessToken, userId, row) {
   if (!res.ok) throw new Error((data && data.message) || "Failed to save closing");
   return data[0];
 }
+
+// --- Audit Trail (Phase 10) ---
+// Persistent, cross-session change log - the upgrade from the earlier
+// in-memory-only Undo. Needs a one-time table + RLS setup in Supabase (see
+// the SQL note above logChange below); until that's run, these calls fail
+// quietly and the app behaves exactly as it did before this table existed -
+// editing/deleting/toggling still works, it just isn't logged yet.
+async function auditLogList(accessToken) {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/audit_log?select=*&order=created_at.desc&limit=50`, {
+    headers: { apikey: SUPABASE_PUBLISHABLE_KEY, Authorization: `Bearer ${accessToken}` },
+  });
+  if (!res.ok) throw new Error("Failed to load audit trail");
+  return res.json();
+}
+async function auditLogInsert(accessToken, row) {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/audit_log`, {
+    method: "POST",
+    headers: { apikey: SUPABASE_PUBLISHABLE_KEY, Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json", Prefer: "return=representation" },
+    body: JSON.stringify(row),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error((data && data.message) || "Failed to log change");
+  return data[0];
+}
+
 function computeInvoiceTotals(items, gstMode, gstRate) {
   const subtotal = items.reduce((s, it) => s + (Number(it.qty) || 0) * (Number(it.rate) || 0), 0);
   const gstAmount = (subtotal * (Number(gstRate) || 0)) / 100;
@@ -783,6 +808,40 @@ const BUSINESS_TYPE_LABELS = {
   other: "Other",
 };
 
+// --- AI Business Goals (Phase 10) ---
+// Simple owner-set targets, tracked against figures BahiSathi already
+// computes elsewhere (cash balance, outstanding receivables, this month's
+// revenue and expense ratio) - no new tracking logic, just a target to
+// measure the existing numbers against.
+const GOAL_TYPES = {
+  min_cash: { label: "Minimum cash balance", unit: "₹", prompt: "Keep at least" },
+  max_receivables: { label: "Maximum receivables outstanding", unit: "₹", prompt: "Keep receivables below" },
+  monthly_revenue: { label: "Monthly revenue target", unit: "₹", prompt: "Reach" },
+  max_expense_ratio: { label: "Expense ratio cap", unit: "%", prompt: "Keep expenses under" },
+};
+function goalProgress(goal, ctx) {
+  const fmt = (n) => `₹${Math.round(n).toLocaleString("en-IN")}`;
+  if (goal.type === "min_cash") {
+    if (ctx.cashBalance == null) return { status: "no_data", label: "No cash balance entered yet - set it on the GST tab." };
+    const pct = goal.target > 0 ? Math.min(100, Math.round((ctx.cashBalance / goal.target) * 100)) : 100;
+    return { status: ctx.cashBalance >= goal.target ? "met" : "behind", pct, label: `${fmt(ctx.cashBalance)} of ${fmt(goal.target)} target` };
+  }
+  if (goal.type === "max_receivables") {
+    const pct = goal.target > 0 ? Math.min(100, Math.round((ctx.totalOutstanding / goal.target) * 100)) : 100;
+    return { status: ctx.totalOutstanding <= goal.target ? "met" : "behind", pct, label: `${fmt(ctx.totalOutstanding)} outstanding, target under ${fmt(goal.target)}` };
+  }
+  if (goal.type === "monthly_revenue") {
+    const pct = goal.target > 0 ? Math.min(100, Math.round((ctx.monthRevenue / goal.target) * 100)) : 0;
+    return { status: ctx.monthRevenue >= goal.target ? "met" : "behind", pct, label: `${fmt(ctx.monthRevenue)} of ${fmt(goal.target)} this month` };
+  }
+  if (goal.type === "max_expense_ratio") {
+    if (ctx.monthExpenseRatio == null) return { status: "no_data", label: "Not enough revenue this month to compute a ratio yet." };
+    const pct = goal.target > 0 ? Math.min(100, Math.round((ctx.monthExpenseRatio / goal.target) * 100)) : 100;
+    return { status: ctx.monthExpenseRatio <= goal.target ? "met" : "behind", pct, label: `Expenses at ${Math.round(ctx.monthExpenseRatio)}% of revenue, target under ${goal.target}%` };
+  }
+  return { status: "no_data", label: "Unknown goal type." };
+}
+
 // A bill's line items can span more than one expense head (e.g. hardware
 // plus a delivery charge). This rolls that up to a single label for the
 // ledger list and CSV/Excel export - "Mixed" when items disagree, otherwise
@@ -791,6 +850,53 @@ function deriveCategory(items) {
   if (!Array.isArray(items) || items.length === 0) return "other";
   const distinct = new Set(items.map((it) => it.category || "other"));
   return distinct.size === 1 ? [...distinct][0] : "mixed";
+}
+
+// Confidence + Explanation (Phase 10): a plain-language reason for why a
+// bill landed in its category, computed from this vendor's own recorded
+// history - the same evidence a human bookkeeper would point to ("we've
+// always filed these under office supplies"), surfaced on request instead
+// of asking the owner to trust a black box.
+function categoryExplanation(entry, allEntries) {
+  if (!entry.vendor || !entry.vendor.trim()) {
+    return "No vendor name recorded on this bill, so this is a general fallback category rather than a learned one.";
+  }
+  const label = CATEGORY_LABELS[entry.category] || entry.category || "this category";
+  const sameVendor = allEntries.filter((e) => e.id !== entry.id && e.vendor && e.vendor.trim().toLowerCase() === entry.vendor.trim().toLowerCase());
+  if (sameVendor.length === 0) {
+    return entry.vendor_source === "handwritten_only"
+      ? `Best guess from a handwritten bill with no earlier history for ${entry.vendor.trim()} - worth double-checking.`
+      : `First bill recorded from ${entry.vendor.trim()} - "${label}" is the AI's read of the bill text, not a learned pattern yet.`;
+  }
+  const matching = sameVendor.filter((e) => (e.category || "other") === (entry.category || "other"));
+  if (matching.length === sameVendor.length) {
+    return `Marked as ${label} because all ${sameVendor.length} previous bill${sameVendor.length === 1 ? "" : "s"} from ${entry.vendor.trim()} were too.`;
+  }
+  if (matching.length > sameVendor.length / 2) {
+    return `Marked as ${label} because ${matching.length} of your last ${sameVendor.length} bills from ${entry.vendor.trim()} were also ${label} - a few others were filed differently.`;
+  }
+  return `${entry.vendor.trim()} has been categorized inconsistently before (only ${matching.length} of ${sameVendor.length} past bills match "${label}") - worth checking this one is right.`;
+}
+
+// Field-by-field diff for an audit_log row's before/after snapshots - only
+// the fields that actually changed, in plain language rather than a raw
+// JSON dump.
+const AUDIT_FIELD_LABELS = {
+  bill: { vendor: "Vendor", date: "Date", category: "Category", total: "Total", cgst: "CGST", sgst: "SGST", igst: "IGST", is_personal: "Personal" },
+  invoice: { status: "Status", paid_date: "Paid date", payment_method: "Payment method" },
+};
+function auditDiffLines(log) {
+  if (!log.before || !log.after) return [];
+  const fields = AUDIT_FIELD_LABELS[log.entity_type] || {};
+  const lines = [];
+  for (const key in fields) {
+    const a = log.before[key];
+    const b = log.after[key];
+    if (JSON.stringify(a ?? null) !== JSON.stringify(b ?? null)) {
+      lines.push(`${fields[key]}: ${a ?? "—"} → ${b ?? "—"}`);
+    }
+  }
+  return lines;
 }
 
 function ItemsEditor({ items, onChange }) {
@@ -952,6 +1058,41 @@ function pnlForPeriod(entries, invoices, pKey) {
     .slice(0, 4)
     .map(([category, total]) => ({ category: CATEGORY_LABELS[category] || category, total }));
   return { revenue, expenses, net: revenue - expenses, topCategories, invoiceCount: revenueRows.length, billCount: businessEntries.length };
+}
+
+// 6-month P&L trend (Phase 9): the same pnlForPeriod math run once per
+// month, oldest first, ending with the current in-progress month - lets an
+// owner see at a glance whether margins are improving or slipping instead
+// of only ever seeing one month in isolation.
+function pnlTrend(entries, invoices, months = 6) {
+  const now = new Date();
+  const keys = [];
+  for (let i = months - 1; i >= 0; i--) {
+    const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+    keys.push({ key: `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`, label: d.toLocaleDateString("en-IN", { month: "short", year: "2-digit" }) });
+  }
+  return keys.map(({ key, label }) => ({ key, label, ...pnlForPeriod(entries, invoices, key) }));
+}
+
+// Month-End AI Review (Phase 10): a computed (not a new AI call) "what
+// changed / what improved / what needs attention / top 3 for next month"
+// summary, built from this month's P&L against last month's, plus the same
+// prioritized items Action Center already assembled - a mini CFO readout
+// without inventing a new data source or backend call.
+function monthEndReview(pnl, prevPnl, actionItems) {
+  const revenueChangePct = prevPnl.revenue > 0 ? ((pnl.revenue - prevPnl.revenue) / prevPnl.revenue) * 100 : null;
+  const expenseChangePct = prevPnl.expenses > 0 ? ((pnl.expenses - prevPnl.expenses) / prevPnl.expenses) * 100 : null;
+  const netChange = pnl.net - prevPnl.net;
+  const improved = [];
+  const attention = [];
+  if (revenueChangePct != null && revenueChangePct >= 5) improved.push(`Revenue up ${Math.round(revenueChangePct)}% vs last month`);
+  if (revenueChangePct != null && revenueChangePct <= -5) attention.push(`Revenue down ${Math.abs(Math.round(revenueChangePct))}% vs last month`);
+  if (expenseChangePct != null && expenseChangePct <= -5) improved.push(`Expenses down ${Math.abs(Math.round(expenseChangePct))}% vs last month`);
+  if (expenseChangePct != null && expenseChangePct >= 10) attention.push(`Expenses up ${Math.round(expenseChangePct)}% vs last month`);
+  if (netChange > 0) improved.push(`Net profit up ₹${Math.round(netChange).toLocaleString("en-IN")} vs last month`);
+  else if (netChange < 0) attention.push(`Net profit down ₹${Math.round(Math.abs(netChange)).toLocaleString("en-IN")} vs last month`);
+  const topActions = actionItems.slice(0, 3).map((it) => it.title);
+  return { revenueChangePct, expenseChangePct, netChange, improved, attention, topActions };
 }
 
 // AI GST Guardian (basic): checks only BahiSathi's own captured data - no
@@ -1241,6 +1382,136 @@ function expenseLeakFindings(entries) {
   }
 
   return findings.sort((x, y) => severityRank(y.severity) - severityRank(x.severity) || y.amount - x.amount);
+}
+
+// --- "What changed since yesterday?" (Phase 9) ---
+// A rolling 24-hour digest built entirely from timestamps/dates already on
+// entries and invoices (created_at, paid_date, closing_date) - no separate
+// "last seen" state to persist, so it's always "since this time yesterday"
+// rather than "since you last opened the app". Deliberately only reports
+// things that are directly observable this way (new bills, new invoices,
+// collections, cash closing) rather than guessing at GST movement or
+// anomaly deltas that would need a stored snapshot to compare against.
+function whatChangedSinceYesterday(entries, invoices, dailyClosings) {
+  const now = new Date();
+  const since = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1);
+  const inWindow = (d) => !!d && new Date(d).getTime() >= since.getTime();
+
+  const newBills = entries.filter((e) => !e.is_personal && inWindow(e.created_at));
+  const newBillsTotal = newBills.reduce((s, e) => s + (Number(e.total) || 0), 0);
+
+  const newInvoices = invoices.filter((inv) => inWindow(inv.created_at));
+  const newInvoicesTotal = newInvoices.reduce((s, inv) => s + (Number(inv.total) || 0), 0);
+
+  const collections = invoices.filter((inv) => inv.status === "paid" && inv.paid_date && inWindow(inv.paid_date));
+  const collectionsTotal = collections.reduce((s, inv) => s + (Number(inv.total) || 0), 0);
+
+  const todayStr = now.toISOString().slice(0, 10);
+  const yesterdayStr = since.toISOString().slice(0, 10);
+  const recentClosing = dailyClosings.find((c) => c.closing_date === todayStr || c.closing_date === yesterdayStr);
+
+  const hasActivity = newBills.length > 0 || newInvoices.length > 0 || collections.length > 0 || !!recentClosing;
+
+  return { hasActivity, newBills, newBillsTotal, newInvoices, newInvoicesTotal, collections, collectionsTotal, recentClosing };
+}
+
+// --- Business Calendar (Phase 10) ---
+// Merges GST filing dates, recurring vendor bills coming due, and
+// receivables likely to land soon into one date-sorted "what's coming up"
+// list - the same underlying signals GST Guardian, Smart Recurring, and
+// Receivable Probability already compute, just organized by date instead of
+// by feature, which is how an owner actually thinks about the next few
+// weeks. Windowed to -3..+30 days so a just-missed date still shows briefly
+// as overdue before dropping off.
+function buildBusinessCalendar(gstReminders, recurringVendors, receivableRows) {
+  const items = [];
+  items.push({ date: gstReminders.gstr1.due, daysLeft: gstReminders.gstr1.daysLeft, type: "gst", label: `GSTR-1 filing due (${gstReminders.gstr1.period})` });
+  items.push({ date: gstReminders.gstr3b.due, daysLeft: gstReminders.gstr3b.daysLeft, type: "gst", label: `GSTR-3B filing + payment due (${gstReminders.gstr3b.period})` });
+  recurringVendors.forEach((r) => {
+    items.push({ date: new Date(r.nextDueDate), daysLeft: r.daysUntilDue, type: "bill", label: `${r.vendor} bill expected, ~₹${Math.round(r.avgAmount).toLocaleString("en-IN")}` });
+  });
+  receivableRows
+    .filter((r) => r.bucket === "likely_soon")
+    .forEach((r) => {
+      const expected = new Date(r.invoice.invoice_date);
+      expected.setDate(expected.getDate() + r.expectedDelay);
+      items.push({ date: expected, daysLeft: Math.round((expected - new Date()) / 86400000), type: "receivable", label: `${r.customerName} expected to pay ₹${r.total.toLocaleString("en-IN")} (${r.invoice.invoice_number})` });
+    });
+  return items.filter((it) => it.daysLeft >= -3 && it.daysLeft <= 30).sort((a, b) => a.date - b.date);
+}
+
+// --- Missing Money Detector (Phase 9) ---
+// An invoice marked paid should leave a trace somewhere else BahiSathi
+// already tracks: a matched bank/UPI transaction for non-cash payments, or
+// a same-day evening closing for cash ones. When neither exists, the sale
+// is recorded as collected but nothing independently confirms the money
+// actually arrived - the same spirit as Evening Closing's own per-day
+// mismatch check, just widened across the whole ledger instead of one day
+// at a time.
+function missingMoneyFindings(invoices, bankTransactions, dailyClosings) {
+  const findings = [];
+  const paidInvoices = invoices.filter((inv) => inv.status === "paid" && inv.paid_date);
+  for (const inv of paidInvoices) {
+    const total = Number(inv.total) || 0;
+    if (!total) continue;
+    if (inv.payment_method === "Cash") {
+      const closing = dailyClosings.find((c) => c.closing_date === inv.paid_date);
+      if (!closing) {
+        findings.push({
+          severity: total > 10000 ? "high" : "medium",
+          label: `${inv.invoice_number}: ₹${total.toLocaleString("en-IN")} cash sale not yet reconciled`,
+          hint: `Marked paid in cash on ${inv.paid_date}, but no evening closing was logged for that day - worth confirming the cash actually came in.`,
+          amount: total,
+        });
+      }
+    } else {
+      const matched = bankTransactions.find((t) => t.matched_invoice_id === inv.id);
+      if (!matched) {
+        findings.push({
+          severity: total > 10000 ? "high" : "medium",
+          label: `${inv.invoice_number}: ₹${total.toLocaleString("en-IN")} marked paid via ${inv.payment_method || "bank/UPI"} with no matching bank record`,
+          hint: `Paid on ${inv.paid_date} - link it to a bank/UPI transaction on the Bank tab, or confirm it was actually received.`,
+          amount: total,
+        });
+      }
+    }
+  }
+  return findings.sort((a, b) => severityRank(b.severity) - severityRank(a.severity) || b.amount - a.amount);
+}
+
+// --- Smart Customer Follow-up Tone (Phase 9) ---
+// The reminder text gets progressively firmer the further a customer's
+// oldest unpaid invoice has drifted past THEIR OWN usual payment pace
+// (avgDelay from paymentProfileFor), not a flat day count - a customer who
+// normally takes 45 days isn't "overdue" on day 40, but one who normally
+// pays in 10 days and is now at 25 needs a firmer nudge than that day count
+// alone would suggest. A worsening trend bumps the tone up one notch even
+// if the ratio alone wouldn't. BahiSathi only ever drafts the text into a
+// wa.me link - the owner still presses send themselves inside WhatsApp.
+const FOLLOWUP_TIERS = [
+  { key: "friendly", label: "Friendly nudge" },
+  { key: "reminder", label: "Reminder" },
+  { key: "overdue", label: "Overdue notice" },
+  { key: "final", label: "Final follow-up" },
+];
+function followUpDraft(customer, profile, businessName) {
+  if (!profile.unpaidCount || profile.outstanding <= 0) return null;
+  const expectedDelay = profile.avgDelay != null && profile.avgDelay > 0 ? profile.avgDelay : 15;
+  const ratio = profile.maxOverdueDays / expectedDelay;
+  let tierIndex = ratio <= 1 ? 0 : ratio <= 1.5 ? 1 : ratio <= 2.5 ? 2 : 3;
+  if (profile.trend === "worse" && tierIndex < 3) tierIndex += 1;
+  const tier = FOLLOWUP_TIERS[tierIndex];
+  const firstName = (customer.name || "there").split(" ")[0];
+  const biz = businessName || "us";
+  const amount = `₹${Math.round(profile.outstanding).toLocaleString("en-IN")}`;
+  const days = profile.maxOverdueDays;
+  const messages = {
+    friendly: `Hi ${firstName}, hope business is going well! Just a friendly note that ${amount} is currently outstanding with ${biz}. No rush at all - let us know if you have any questions. Thank you!`,
+    reminder: `Hi ${firstName}, this is a reminder from ${biz} - ${amount} has been outstanding for about ${days} day${days === 1 ? "" : "s"} now. Could you let us know an expected payment date? Thanks so much!`,
+    overdue: `Hi ${firstName}, ${amount} owed to ${biz} is now ${days} days overdue, longer than usual for your account. Please arrange payment at the earliest, or let us know if there's an issue we can help with.`,
+    final: `Hi ${firstName}, ${amount} owed to ${biz} has been outstanding for ${days} days now, well past the usual. This is a final follow-up - please clear this at the earliest to avoid any disruption to future orders. Thank you for your prompt attention.`,
+  };
+  return { tier: tier.key, tierLabel: tier.label, message: messages[tier.key] };
 }
 
 function ConfidenceDot({ score }) {
@@ -1958,6 +2229,15 @@ function ProductApp({ session, onLogout, setPage }) {
   const [savingEdit, setSavingEdit] = useState(false);
   const [editError, setEditError] = useState(null);
   const [deleteConfirmId, setDeleteConfirmId] = useState(null);
+  const [explainEntryId, setExplainEntryId] = useState(null);
+  // Phase 10: persistent Audit Trail - backed by the audit_log table (see
+  // logChange/restoreAuditEntry below), so unlike the first cut of this
+  // feature it survives reload. auditLog holds the most recent rows
+  // (audit_log_list caps at 50); restoringLogId/expandedLogId are UI-only.
+  const [auditLog, setAuditLog] = useState([]);
+  const [auditLogLoaded, setAuditLogLoaded] = useState(false);
+  const [restoringLogId, setRestoringLogId] = useState(null);
+  const [expandedLogId, setExpandedLogId] = useState(null);
   const [dupConfirmed, setDupConfirmed] = useState(false);
   const [dragOver, setDragOver] = useState(false);
   const [manualEntryOpen, setManualEntryOpen] = useState(false);
@@ -1973,6 +2253,15 @@ function ProductApp({ session, onLogout, setPage }) {
   const [businessSaved, setBusinessSaved] = useState(false);
   const [cashBalanceInput, setCashBalanceInput] = useState("");
   const [cashBalanceSaving, setCashBalanceSaving] = useState(false);
+  // Phase 10: AI Business Goals - stored as a "goals" jsonb column on
+  // business_profiles (see the goals SQL note near saveBusinessGoals below).
+  // Defaults to an empty array so nothing breaks before that column exists.
+  const [businessGoals, setBusinessGoals] = useState([]);
+  const [goalsLoaded, setGoalsLoaded] = useState(false);
+  const [savingGoal, setSavingGoal] = useState(false);
+  const [goalsError, setGoalsError] = useState(null);
+  const [newGoalType, setNewGoalType] = useState("min_cash");
+  const [newGoalValue, setNewGoalValue] = useState("");
   const [cashBalanceSaved, setCashBalanceSaved] = useState(false);
   const [morningBriefSaving, setMorningBriefSaving] = useState(false);
   const [askQuestion, setAskQuestion] = useState("");
@@ -2380,13 +2669,19 @@ function ProductApp({ session, onLogout, setPage }) {
         setCashBalanceInput(loaded.cash_balance != null ? String(loaded.cash_balance) : "");
         // Nothing saved yet - go straight to the form instead of an empty card.
         setBusinessEditing(!(loaded.business_name || loaded.gstin));
+        // goals is a separate optional column - defaults to [] both if the
+        // column doesn't exist yet on this account's table and if it's just
+        // never been set, so the feature degrades gracefully either way.
+        setBusinessGoals(profile && Array.isArray(profile.goals) ? profile.goals : []);
       } catch (e) {
         console.error(e);
         const empty = { business_name: "", business_type: "", gstin: "", address: "", website: "", email: "", cash_balance: null, cash_balance_updated_at: null, morning_brief_enabled: false };
         setBusinessProfile(empty);
         setSavedBusinessProfile(empty);
         setBusinessEditing(true);
+        setBusinessGoals([]);
       }
+      setGoalsLoaded(true);
       setBusinessLoaded(true);
     })();
   }, [session]);
@@ -2417,6 +2712,55 @@ function ProductApp({ session, onLogout, setPage }) {
       console.error(e);
     } finally {
       setCashBalanceSaving(false);
+    }
+  }
+
+  // AI Business Goals (Phase 10) - stored as a "goals" jsonb array on the
+  // same business_profiles row as everything else on the Business tab. If
+  // this column doesn't exist yet, businessProfileSave will fail with a
+  // clear Postgres error surfaced in goalsError; run this once in the
+  // Supabase SQL editor to add it:
+  //   ALTER TABLE business_profiles ADD COLUMN IF NOT EXISTS goals jsonb DEFAULT '[]'::jsonb;
+  async function addGoal() {
+    const target = Number(newGoalValue);
+    if (!target || target <= 0) return;
+    setSavingGoal(true);
+    setGoalsError(null);
+    try {
+      const goal = { id: `${Date.now()}`, type: newGoalType, target, created_at: new Date().toISOString() };
+      const nextGoals = [...businessGoals, goal];
+      await businessProfileSave(session.access_token, session.user.id, {
+        business_name: businessProfile.business_name || null,
+        business_type: businessProfile.business_type || null,
+        gstin: businessProfile.gstin || null,
+        address: businessProfile.address || null,
+        website: businessProfile.website || null,
+        email: businessProfile.email || null,
+        goals: nextGoals,
+      });
+      setBusinessGoals(nextGoals);
+      setNewGoalValue("");
+    } catch (e) {
+      setGoalsError(e.message && e.message.includes("column") ? "Goals need a one-time setup step in Supabase - see the note in the code, or ask Claude to walk you through it." : e.message || "Could not save this goal - please try again.");
+    } finally {
+      setSavingGoal(false);
+    }
+  }
+  async function deleteGoal(id) {
+    const nextGoals = businessGoals.filter((g) => g.id !== id);
+    try {
+      await businessProfileSave(session.access_token, session.user.id, {
+        business_name: businessProfile.business_name || null,
+        business_type: businessProfile.business_type || null,
+        gstin: businessProfile.gstin || null,
+        address: businessProfile.address || null,
+        website: businessProfile.website || null,
+        email: businessProfile.email || null,
+        goals: nextGoals,
+      });
+      setBusinessGoals(nextGoals);
+    } catch (e) {
+      console.error(e);
     }
   }
 
@@ -2598,6 +2942,21 @@ function ProductApp({ session, onLogout, setPage }) {
     })();
   }, [session]);
 
+  // Fails quietly if the audit_log table hasn't been created yet - the
+  // trail just stays empty until the one-time SQL migration is run, same
+  // graceful-degrade approach as AI Business Goals' "goals" column.
+  useEffect(() => {
+    (async () => {
+      try {
+        const rows = await auditLogList(session.access_token);
+        setAuditLog(rows);
+      } catch (e) {
+        console.error(e);
+      }
+      setAuditLogLoaded(true);
+    })();
+  }, [session]);
+
   // Whenever the selected closing date changes (or closings finish loading),
   // prefill the form from any already-saved closing for that date.
   useEffect(() => {
@@ -2731,6 +3090,7 @@ function ProductApp({ session, onLogout, setPage }) {
     // Record when it was actually paid (not just the invoice date) so payment
     // delay/behavior can be computed per customer - reset it if un-marking.
     const paidDate = newStatus === "paid" ? new Date().toISOString().slice(0, 10) : null;
+    const before = { status: inv.status, paid_date: inv.paid_date, payment_method: inv.payment_method };
     try {
       const updated = await invoicesUpdate(session.access_token, inv.id, {
         status: newStatus,
@@ -2738,6 +3098,7 @@ function ProductApp({ session, onLogout, setPage }) {
         payment_method: newStatus === "paid" ? paymentMethod || "Other" : null,
       });
       setInvoices((prev) => prev.map((x) => (x.id === inv.id ? updated : x)));
+      logChange("invoice", inv.id, "status_changed", `Marked ${inv.invoice_number || "an invoice"} ${newStatus}`, before, { status: newStatus, paid_date: paidDate, payment_method: updated.payment_method });
     } catch (e) {
       console.error(e);
     }
@@ -2880,6 +3241,65 @@ function ProductApp({ session, onLogout, setPage }) {
     const label = score >= 80 ? "Excellent" : score >= 60 ? "Good" : score >= 40 ? "Fair" : score >= 20 ? "Poor" : "Risky";
     const color = score >= 80 ? C.green : score >= 60 ? C.green : score >= 40 ? C.amber : C.red;
     return { score, label, color };
+  }
+
+  // Receivable Probability (Phase 9): buckets every unpaid invoice by how
+  // likely it is to be collected soon, using that customer's own average
+  // days-to-pay rather than one flat overdue cutoff for everyone - a
+  // customer who reliably pays in 45 days isn't "at risk" on day 40, but a
+  // customer whose average is 15 days and is now at 40 almost certainly is.
+  // Customers with no payment history yet fall back to a neutral 30-day
+  // assumption rather than being silently excluded.
+  function receivableForecast() {
+    const unpaid = invoices.filter((inv) => inv.status !== "paid" && inv.total != null);
+    const today = new Date();
+    let likelySoon = 0, atRisk = 0, dueLater = 0;
+    const rows = unpaid.map((inv) => {
+      const profile = paymentProfileFor(inv.customer_id);
+      const ageDays = Math.round((today - new Date(inv.invoice_date)) / 86400000);
+      const expectedDelay = profile.avgDelay != null ? profile.avgDelay : 30;
+      const daysRemaining = expectedDelay - ageDays;
+      let bucket;
+      if (profile.trend === "worse" || ageDays > expectedDelay * 1.5) bucket = "at_risk";
+      else if (daysRemaining <= 7) bucket = "likely_soon";
+      else bucket = "due_later";
+      const total = Number(inv.total) || 0;
+      if (bucket === "likely_soon") likelySoon += total;
+      else if (bucket === "at_risk") atRisk += total;
+      else dueLater += total;
+      const customer = customers.find((c) => c.id === inv.customer_id);
+      return { invoice: inv, bucket, ageDays, expectedDelay, customerName: customer ? customer.name : "Unknown customer", total };
+    });
+    return { rows, likelySoon, atRisk, dueLater, total: likelySoon + atRisk + dueLater };
+  }
+
+  // Customer Profitability proxy (Phase 10): BahiSathi doesn't track
+  // per-sale cost of goods, discounts, or logistics cost, so a true
+  // profit-margin ranking isn't possible from what's recorded today - this
+  // is a payment-quality-adjusted revenue proxy instead: paid revenue minus
+  // a notional cost of capital for that customer's own average payment
+  // delay, minus a discount for their currently at-risk/likely-soon
+  // outstanding balance. A ₹5L customer who pays in 90 days and has ₹1L
+  // stuck at-risk can rank behind a ₹2L customer who always pays in 10 days
+  // - directionally useful, not a substitute for real margin data once
+  // purchase costs are tracked per sale.
+  function customerProfitabilityProxy() {
+    const COST_OF_CAPITAL_ANNUAL = 0.12;
+    const rf = receivableForecast();
+    return customers
+      .map((c) => {
+        const paid = invoices.filter((inv) => inv.customer_id === c.id && inv.status === "paid");
+        const paidRevenue = paid.reduce((s, inv) => s + (Number(inv.subtotal) || Number(inv.total) || 0), 0);
+        if (paidRevenue <= 0) return null;
+        const profile = paymentProfileFor(c.id);
+        const carryingCost = profile.avgDelay != null ? paidRevenue * (profile.avgDelay / 365) * COST_OF_CAPITAL_ANNUAL : 0;
+        const riskRows = rf.rows.filter((r) => r.invoice.customer_id === c.id);
+        const riskDiscount = riskRows.reduce((s, r) => s + (r.bucket === "at_risk" ? r.total * 0.3 : r.bucket === "likely_soon" ? r.total * 0.05 : 0), 0);
+        const effectiveValue = paidRevenue - carryingCost - riskDiscount;
+        return { customer: c, paidRevenue, carryingCost, riskDiscount, effectiveValue, avgDelay: profile.avgDelay };
+      })
+      .filter(Boolean)
+      .sort((a, b) => b.effectiveValue - a.effectiveValue);
   }
 
   // "Can I give him credit?" - layered on the Trust Score above. Sends the
@@ -3151,6 +3571,82 @@ function ProductApp({ session, onLogout, setPage }) {
     setStep("upload");
   }
 
+  // Audit Trail (Phase 10) - persists to the audit_log table and prepends
+  // to local state. The underlying bill/invoice change has already been
+  // applied by the caller before this runs, so a failure here (most likely
+  // because the audit_log table hasn't been created yet - see the SQL note
+  // above auditLogList) never blocks the actual save/delete/toggle.
+  async function logChange(entityType, entityId, action, summary, before, after) {
+    try {
+      const saved = await auditLogInsert(session.access_token, {
+        user_id: effectiveOwnerId,
+        created_by: session.user.id,
+        entity_type: entityType,
+        entity_id: String(entityId),
+        action,
+        summary,
+        before: before ?? null,
+        after: after ?? null,
+      });
+      setAuditLog((prev) => [saved, ...prev].slice(0, 50));
+    } catch (e) {
+      console.error("Audit log not available yet:", e.message);
+    }
+  }
+
+  // Reverts a bill/invoice back to its "before" snapshot from an audit_log
+  // row - works regardless of how long ago the change was made, since it
+  // reads from Supabase rather than in-memory state. Deleted bills come
+  // back as a new row (the old id no longer exists in the database);
+  // edits and status changes revert in place.
+  async function restoreAuditEntry(log) {
+    setRestoringLogId(log.id);
+    try {
+      if (log.entity_type === "bill" && log.action === "deleted") {
+        const b = log.before;
+        const restored = await billsInsert(session.access_token, {
+          user_id: effectiveOwnerId,
+          created_by: session.user.id,
+          vendor: b.vendor,
+          bill_date: b.date,
+          gstin: b.gstin,
+          cgst: b.cgst,
+          sgst: b.sgst,
+          igst: b.igst,
+          total: b.total,
+          category: b.category,
+          items: b.items,
+          is_personal: b.is_personal,
+        });
+        setEntries((prev) => [...prev, { id: restored.id, vendor: restored.vendor, date: restored.bill_date, gstin: restored.gstin, cgst: restored.cgst, sgst: restored.sgst, igst: restored.igst, total: restored.total, category: restored.category, items: restored.items, vendor_source: restored.vendor_source, confidence: restored.confidence, is_personal: restored.is_personal, created_at: restored.created_at, created_by: restored.created_by }]);
+        await logChange("bill", restored.id, "restored", `Restored: ${log.summary}`, log.after, log.before);
+      } else if (log.entity_type === "bill") {
+        const b = log.before;
+        const saved = await billsUpdate(session.access_token, log.entity_id, {
+          vendor: b.vendor,
+          bill_date: b.date,
+          category: b.category,
+          items: b.items,
+          total: b.total,
+          cgst: b.cgst,
+          sgst: b.sgst,
+          igst: b.igst,
+          is_personal: b.is_personal,
+        });
+        setEntries((prev) => prev.map((e) => (e.id === log.entity_id ? { ...e, vendor: saved.vendor, date: saved.bill_date, category: saved.category, items: saved.items, total: saved.total, cgst: saved.cgst, sgst: saved.sgst, igst: saved.igst, is_personal: saved.is_personal } : e)));
+        await logChange("bill", log.entity_id, "restored", `Restored: ${log.summary}`, log.after, log.before);
+      } else if (log.entity_type === "invoice") {
+        const saved = await invoicesUpdate(session.access_token, log.entity_id, log.before);
+        setInvoices((prev) => prev.map((x) => (x.id === log.entity_id ? saved : x)));
+        await logChange("invoice", log.entity_id, "restored", `Restored: ${log.summary}`, log.after, log.before);
+      }
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setRestoringLogId(null);
+    }
+  }
+
   function startEditEntry(entry) {
     setDeleteConfirmId(null);
     setEditError(null);
@@ -3172,6 +3668,7 @@ function ProductApp({ session, onLogout, setPage }) {
     setSavingEdit(true);
     setEditError(null);
     try {
+      const before = entries.find((e) => e.id === id);
       const hasItems = editDraft.items && editDraft.items.length > 1;
       const patch = {
         vendor: editDraft.vendor,
@@ -3186,6 +3683,16 @@ function ProductApp({ session, onLogout, setPage }) {
       };
       const saved = await billsUpdate(session.access_token, id, patch);
       setEntries((prev) => prev.map((e) => (e.id === id ? { ...e, vendor: saved.vendor, date: saved.bill_date, category: saved.category, items: saved.items, total: saved.total, cgst: saved.cgst, sgst: saved.sgst, igst: saved.igst, is_personal: saved.is_personal } : e)));
+      if (before) {
+        logChange(
+          "bill",
+          id,
+          "updated",
+          `Edited ${before.vendor || "a bill"}`,
+          { vendor: before.vendor, date: before.date, category: before.category, total: before.total, cgst: before.cgst, sgst: before.sgst, igst: before.igst, is_personal: before.is_personal, items: before.items },
+          { vendor: saved.vendor, date: saved.bill_date, category: saved.category, total: saved.total, cgst: saved.cgst, sgst: saved.sgst, igst: saved.igst, is_personal: saved.is_personal, items: saved.items }
+        );
+      }
       setEditingId(null);
       setEditDraft(null);
     } catch (e) {
@@ -3201,11 +3708,22 @@ function ProductApp({ session, onLogout, setPage }) {
       return;
     }
     try {
+      const before = entries.find((e) => e.id === id);
       await billsDelete(session.access_token, id);
       setEntries((prev) => prev.filter((e) => e.id !== id));
       if (editingId === id) {
         setEditingId(null);
         setEditDraft(null);
+      }
+      if (before) {
+        logChange(
+          "bill",
+          id,
+          "deleted",
+          `Deleted ${before.vendor || "a bill"}`,
+          { vendor: before.vendor, date: before.date, gstin: before.gstin, category: before.category, total: before.total, cgst: before.cgst, sgst: before.sgst, igst: before.igst, is_personal: before.is_personal, items: before.items },
+          null
+        );
       }
     } catch (e) {
       setEditError(e.message || "Could not delete this entry - please try again.");
@@ -3262,6 +3780,36 @@ function ProductApp({ session, onLogout, setPage }) {
     }
     XLSX.utils.book_append_sheet(wb, ws, "Ledger");
     XLSX.writeFile(wb, "bahisathi-ledger.xlsx");
+  }
+
+  // P&L statement export (Phase 9) - same header-row pattern as the ledger
+  // export above, handed to a CA as an actual statement rather than a
+  // screenshot of the Health tab.
+  function exportPnlTrend(trend) {
+    const rows = trend.map((t) => ({
+      Month: t.label,
+      Revenue: Math.round(t.revenue),
+      Expenses: Math.round(t.expenses),
+      Net: Math.round(t.net),
+      Invoices: t.invoiceCount,
+      Bills: t.billCount,
+    }));
+    const wb = XLSX.utils.book_new();
+    let ws;
+    if (businessProfile && (businessProfile.business_name || businessProfile.gstin)) {
+      const headerRows = [
+        [businessProfile.business_name || "BahiSathi P&L"],
+        ...(businessProfile.gstin ? [[`GSTIN: ${businessProfile.gstin}`]] : []),
+        ["Profit & Loss - last 6 months"],
+        [],
+      ];
+      ws = XLSX.utils.aoa_to_sheet(headerRows);
+      XLSX.utils.sheet_add_json(ws, rows, { origin: -1 });
+    } else {
+      ws = XLSX.utils.json_to_sheet(rows);
+    }
+    XLSX.utils.book_append_sheet(wb, ws, "P&L");
+    XLSX.writeFile(wb, "bahisathi-pnl.xlsx");
   }
 
   const monthTotal = entries.reduce((sum, e) => sum + (Number(e.total) || 0), 0);
@@ -3355,6 +3903,17 @@ function ProductApp({ session, onLogout, setPage }) {
             .map((c) => ({ c, t: trustScoreFor(paymentProfileFor(c.id)) }))
             .filter((x) => x.t && x.t.score < 50)
             .sort((a, b) => a.t.score - b.t.score);
+          const rf = receivableForecast();
+          const missingMoney = missingMoneyFindings(invoices, bankTransactions, dailyClosings);
+          const sinceYesterday = whatChangedSinceYesterday(entries, invoices, dailyClosings);
+          const gstReminders = getGstReminders();
+          const calendar = buildBusinessCalendar(gstReminders, detectRecurringVendors(entries), rf.rows);
+          const now2 = new Date();
+          const pKey2 = `${now2.getFullYear()}-${String(now2.getMonth() + 1).padStart(2, "0")}`;
+          const prevDate2 = new Date(now2.getFullYear(), now2.getMonth() - 1, 1);
+          const prevKey2 = `${prevDate2.getFullYear()}-${String(prevDate2.getMonth() + 1).padStart(2, "0")}`;
+          const monthPnl = pnlForPeriod(entries, invoices, pKey2);
+          const prevMonthPnl = pnlForPeriod(entries, invoices, prevKey2);
 
           // Every signal the app already computes, folded into one list of
           // {severity, source, title, hint, ctaLabel, onCta} rows - nothing
@@ -3432,16 +3991,79 @@ function ProductApp({ session, onLogout, setPage }) {
           bookFindings.forEach((f) => {
             items.push({ severity: f.severity, source: "Fix My Books", title: f.label, hint: f.hint, ctaLabel: "View Audit", onCta: () => setTab("audit") });
           });
+          if (rf.atRisk > 0) {
+            items.push({
+              severity: rf.atRisk > rf.likelySoon ? "high" : "medium",
+              source: "Receivable Probability",
+              title: `₹${Math.round(rf.atRisk).toLocaleString("en-IN")} in receivables looks at risk`,
+              hint: `Based on each customer's own usual payment pace, not just a flat overdue date - ₹${Math.round(rf.likelySoon).toLocaleString("en-IN")} still looks likely within 7 days.`,
+              ctaLabel: "View Health",
+              onCta: () => setTab("health"),
+            });
+          }
+          missingMoney.forEach((f) => {
+            items.push({ severity: f.severity, source: "Missing Money", title: f.label, hint: f.hint, ctaLabel: "View Closing", onCta: () => setTab("closing") });
+          });
 
           items.sort((a, b) => severityRank(b.severity) - severityRank(a.severity));
           const topItems = items.slice(0, 12);
           const sevDot = (s) => (s === "high" ? "🔴" : s === "medium" ? "🟡" : "⚪️");
+          const review = monthEndReview(monthPnl, prevMonthPnl, items);
+          const calDot = (t) => (t === "gst" ? "🏛️" : t === "bill" ? "📄" : "💵");
 
           return (
             <div>
               <div style={{ fontFamily: display, fontSize: 19, fontWeight: 600, marginBottom: 4 }}>Action Center</div>
               <div style={{ fontSize: 13, color: C.textMuted, marginBottom: 18, lineHeight: 1.5 }}>
-                Your business pulse in one place - Health, GST Guardian, Cash-Flow Guardian, Trust Score, Payment Behaviour, Fix My Books, Recurring Transactions, Price Watch, and the Leak Detector, sorted by what's worth doing first.
+                Your business pulse in one place - Health, GST Guardian, Cash-Flow Guardian, Trust Score, Payment Behaviour, Fix My Books, Recurring Transactions, Price Watch, Leak Detector, Receivable Probability, and the Missing Money Detector, sorted by what's worth doing first.
+              </div>
+
+              <div style={{ background: C.white, border: `1px solid ${C.cardBorder}`, borderRadius: 8, padding: "14px 18px", marginBottom: 18 }}>
+                <div style={{ fontSize: 12.5, fontWeight: 600, color: C.text, marginBottom: sinceYesterday.hasActivity ? 8 : 0 }}>Since yesterday</div>
+                {!sinceYesterday.hasActivity ? (
+                  <div style={{ fontSize: 12, color: C.textMuted }}>No new bills, invoices, or collections logged in the last day.</div>
+                ) : (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                    {sinceYesterday.newBills.length > 0 && (
+                      <div style={{ fontSize: 12, color: C.text }}>
+                        📄 {sinceYesterday.newBills.length} new bill{sinceYesterday.newBills.length === 1 ? "" : "s"} scanned, ₹{Math.round(sinceYesterday.newBillsTotal).toLocaleString("en-IN")} total
+                      </div>
+                    )}
+                    {sinceYesterday.newInvoices.length > 0 && (
+                      <div style={{ fontSize: 12, color: C.text }}>
+                        🧾 {sinceYesterday.newInvoices.length} new invoice{sinceYesterday.newInvoices.length === 1 ? "" : "s"} raised, ₹{Math.round(sinceYesterday.newInvoicesTotal).toLocaleString("en-IN")} total
+                      </div>
+                    )}
+                    {sinceYesterday.collections.length > 0 && (
+                      <div style={{ fontSize: 12, color: C.green }}>
+                        💰 ₹{Math.round(sinceYesterday.collectionsTotal).toLocaleString("en-IN")} collected across {sinceYesterday.collections.length} invoice{sinceYesterday.collections.length === 1 ? "" : "s"}
+                      </div>
+                    )}
+                    {sinceYesterday.recentClosing && (
+                      <div style={{ fontSize: 12, color: Math.abs(Number(sinceYesterday.recentClosing.difference)) > 0.5 ? C.amber : C.green }}>
+                        🧮 Evening closing logged for {sinceYesterday.recentClosing.closing_date} - {Number(sinceYesterday.recentClosing.difference) === 0 ? "matched exactly" : `${Number(sinceYesterday.recentClosing.difference) > 0 ? "cash over" : "cash short"} by ₹${Math.abs(Number(sinceYesterday.recentClosing.difference)).toLocaleString("en-IN")}`}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+
+              <div style={{ background: C.white, border: `1px solid ${C.cardBorder}`, borderRadius: 8, padding: "14px 18px", marginBottom: 18 }}>
+                <div style={{ fontSize: 12.5, fontWeight: 600, color: C.text, marginBottom: calendar.length ? 8 : 0 }}>Coming up (next 30 days)</div>
+                {calendar.length === 0 ? (
+                  <div style={{ fontSize: 12, color: C.textMuted }}>Nothing dated on the calendar right now.</div>
+                ) : (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+                    {calendar.slice(0, 8).map((it, i) => (
+                      <div key={i} style={{ display: "flex", justifyContent: "space-between", gap: 10, fontSize: 12 }}>
+                        <span style={{ color: C.text }}>{calDot(it.type)} {it.label}</span>
+                        <span style={{ fontFamily: mono, color: it.daysLeft < 0 ? C.red : it.daysLeft <= 3 ? C.amber : C.textMuted, flexShrink: 0, whiteSpace: "nowrap" }}>
+                          {it.daysLeft < 0 ? `${Math.abs(it.daysLeft)}d overdue` : it.daysLeft === 0 ? "today" : `in ${it.daysLeft}d`}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
 
               <div style={{ background: C.white, border: `1px solid ${C.cardBorder}`, borderRadius: 8, padding: "18px 20px", marginBottom: 18, display: "flex", alignItems: "center", gap: 18, flexWrap: "wrap" }}>
@@ -3457,6 +4079,30 @@ function ProductApp({ session, onLogout, setPage }) {
                     Full health breakdown
                   </button>
                 </div>
+              </div>
+
+              <div style={{ background: C.white, border: `1px solid ${C.cardBorder}`, borderRadius: 8, padding: "14px 18px", marginBottom: 18 }}>
+                <div style={{ fontSize: 12.5, fontWeight: 600, color: C.text, marginBottom: 8 }}>Month-end review</div>
+                {review.improved.length === 0 && review.attention.length === 0 ? (
+                  <div style={{ fontSize: 12, color: C.textMuted, marginBottom: review.topActions.length ? 8 : 0 }}>Not enough of a change vs last month to call out yet.</div>
+                ) : (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 4, marginBottom: review.topActions.length ? 10 : 0 }}>
+                    {review.improved.map((s, i) => (
+                      <div key={`i${i}`} style={{ fontSize: 12, color: C.green }}>↑ {s}</div>
+                    ))}
+                    {review.attention.map((s, i) => (
+                      <div key={`a${i}`} style={{ fontSize: 12, color: C.amber }}>↓ {s}</div>
+                    ))}
+                  </div>
+                )}
+                {review.topActions.length > 0 && (
+                  <div style={{ paddingTop: review.improved.length || review.attention.length ? 8 : 0, borderTop: review.improved.length || review.attention.length ? `1px solid ${C.paperLine}` : "none" }}>
+                    <div style={{ fontSize: 11, color: C.textMuted, marginBottom: 3 }}>Top {review.topActions.length} for next month:</div>
+                    {review.topActions.map((t, i) => (
+                      <div key={i} style={{ fontSize: 12, color: C.text }}>{i + 1}. {t}</div>
+                    ))}
+                  </div>
+                )}
               </div>
 
               {topItems.length === 0 ? (
@@ -3497,6 +4143,28 @@ function ProductApp({ session, onLogout, setPage }) {
                   {items.length > topItems.length && (
                     <div style={{ padding: "10px 0", fontSize: 11.5, color: C.textMuted }}>+{items.length - topItems.length} more in Audit and Health.</div>
                   )}
+                </div>
+              )}
+
+              {auditLog.length > 0 && (
+                <div style={{ background: C.white, border: `1px solid ${C.cardBorder}`, borderRadius: 8, padding: "14px 18px", marginTop: 18 }}>
+                  <div style={{ fontSize: 12.5, fontWeight: 600, color: C.text, marginBottom: 8 }}>Recent changes</div>
+                  {auditLog.slice(0, 5).map((u) => (
+                    <div key={u.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "6px 0", borderBottom: `1px solid ${C.paperLine}`, gap: 10 }}>
+                      <div style={{ fontSize: 12, color: C.text }}>
+                        {u.summary}
+                        <span style={{ color: C.textMuted }}> · {new Date(u.created_at).toLocaleString("en-IN", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}</span>
+                      </div>
+                      {u.before && (
+                        <button onClick={() => restoreAuditEntry(u)} disabled={restoringLogId === u.id} style={{ background: "transparent", border: `1px solid ${C.cardBorder}`, color: C.ink, borderRadius: 16, padding: "4px 10px", fontSize: 11, cursor: restoringLogId === u.id ? "default" : "pointer", flexShrink: 0 }}>
+                          {restoringLogId === u.id ? "Undoing…" : "Undo"}
+                        </button>
+                      )}
+                    </div>
+                  ))}
+                  <button onClick={() => setTab("audit")} style={{ marginTop: 8, background: "transparent", border: "none", color: C.ink, textDecoration: "underline", fontSize: 11, cursor: "pointer", padding: 0, fontFamily: sans }}>
+                    View full audit trail
+                  </button>
                 </div>
               )}
             </div>
@@ -3757,10 +4425,24 @@ function ProductApp({ session, onLogout, setPage }) {
                               <span style={{ marginLeft: 6, fontSize: 10, fontWeight: 600, color: C.inkLight, background: "#EAF0FF", borderRadius: 10, padding: "1px 7px" }}>👤 {addedByLabel(e.created_by)}</span>
                             )}
                           </div>
-                          <div style={{ fontSize: 11, color: C.textMuted }}>
-                            {CATEGORY_LABELS[e.category] || e.category}
-                            {Array.isArray(e.items) && e.items.length > 1 ? ` · ${e.items.length} items` : ""}
+                          <div style={{ fontSize: 11, color: C.textMuted, display: "flex", alignItems: "center", gap: 5 }}>
+                            <span>
+                              {CATEGORY_LABELS[e.category] || e.category}
+                              {Array.isArray(e.items) && e.items.length > 1 ? ` · ${e.items.length} items` : ""}
+                            </span>
+                            <button
+                              onClick={(ev) => { ev.stopPropagation(); setExplainEntryId(explainEntryId === e.id ? null : e.id); }}
+                              title="Why this category?"
+                              style={{ background: "transparent", border: "none", color: C.textMuted, cursor: "pointer", padding: 0, fontSize: 11, lineHeight: 1, opacity: 0.7 }}
+                            >
+                              ⓘ
+                            </button>
                           </div>
+                          {explainEntryId === e.id && (
+                            <div onClick={(ev) => ev.stopPropagation()} style={{ fontSize: 11, color: C.textMuted, fontStyle: "italic", marginTop: 4, background: C.paper, borderRadius: 4, padding: "6px 9px", lineHeight: 1.5, cursor: "default" }}>
+                              {categoryExplanation(e, entries)}
+                            </div>
+                          )}
                         </div>
                         <div style={{ fontFamily: mono, color: C.ink, fontWeight: 500, marginRight: 10 }}>₹{Number(e.total || 0).toLocaleString("en-IN")}</div>
                         <div style={{ fontSize: 13, color: C.textMuted }}>✏️</div>
@@ -3902,6 +4584,8 @@ function ProductApp({ session, onLogout, setPage }) {
           const pnl = pnlForPeriod(entries, invoices, pKey);
           const prevPnl = pnlForPeriod(entries, invoices, prevKey);
           const periodLabel = now.toLocaleDateString("en-IN", { month: "long", year: "numeric" });
+          const trend = pnlTrend(entries, invoices, 6);
+          const trendMax = Math.max(1, ...trend.map((t) => Math.max(t.revenue, t.expenses)));
 
           return (
             <div>
@@ -3944,6 +4628,47 @@ function ProductApp({ session, onLogout, setPage }) {
                 )}
               </div>
 
+              {(() => {
+                const rf = receivableForecast();
+                if (rf.total <= 0) return null;
+                return (
+                  <div style={{ background: C.white, border: `1px solid ${C.cardBorder}`, borderRadius: 8, padding: "16px 18px", marginBottom: 16 }}>
+                    <div style={{ fontSize: 13.5, fontWeight: 600, color: C.text, marginBottom: 4 }}>Receivable Probability</div>
+                    <div style={{ fontSize: 11.5, color: C.textMuted, marginBottom: 12, lineHeight: 1.5 }}>
+                      What's outstanding, split by how likely it is to come in soon - based on each customer's own payment history, not one flat overdue cutoff.
+                    </div>
+                    <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 10 }}>
+                      <div style={{ textAlign: "center" }}>
+                        <div style={{ fontFamily: mono, fontSize: 15, fontWeight: 700, color: C.green }}>₹{Math.round(rf.likelySoon).toLocaleString("en-IN")}</div>
+                        <div style={{ fontSize: 10.5, color: C.textMuted, marginTop: 2 }}>Likely within 7 days</div>
+                      </div>
+                      <div style={{ textAlign: "center" }}>
+                        <div style={{ fontFamily: mono, fontSize: 15, fontWeight: 700, color: C.ink }}>₹{Math.round(rf.dueLater).toLocaleString("en-IN")}</div>
+                        <div style={{ fontSize: 10.5, color: C.textMuted, marginTop: 2 }}>Due later</div>
+                      </div>
+                      <div style={{ textAlign: "center" }}>
+                        <div style={{ fontFamily: mono, fontSize: 15, fontWeight: 700, color: rf.atRisk > 0 ? C.red : C.ink }}>₹{Math.round(rf.atRisk).toLocaleString("en-IN")}</div>
+                        <div style={{ fontSize: 10.5, color: C.textMuted, marginTop: 2 }}>At risk</div>
+                      </div>
+                    </div>
+                    {rf.atRisk > 0 && (
+                      <div style={{ marginTop: 12, paddingTop: 12, borderTop: `1px solid ${C.paperLine}` }}>
+                        {rf.rows
+                          .filter((r) => r.bucket === "at_risk")
+                          .sort((a, b) => b.total - a.total)
+                          .slice(0, 5)
+                          .map((r) => (
+                            <div key={r.invoice.id} style={{ display: "flex", justifyContent: "space-between", padding: "4px 0", fontSize: 12 }}>
+                              <span style={{ color: C.text }}>{r.customerName} · {r.invoice.invoice_number}</span>
+                              <span style={{ fontFamily: mono, color: C.red }}>₹{r.total.toLocaleString("en-IN")} ({r.ageDays}d old)</span>
+                            </div>
+                          ))}
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
+
               <div style={{ background: C.white, border: `1px solid ${C.cardBorder}`, borderRadius: 8, padding: "16px 18px" }}>
                 <div style={{ fontSize: 13.5, fontWeight: 600, color: C.text, marginBottom: 4 }}>Profit & loss - {periodLabel}</div>
                 <div style={{ fontSize: 11.5, color: C.textMuted, marginBottom: 12, lineHeight: 1.5 }}>
@@ -3971,6 +4696,35 @@ function ProductApp({ session, onLogout, setPage }) {
                     {pnlNarration}
                   </div>
                 )}
+
+                <div style={{ marginTop: 16, paddingTop: 14, borderTop: `1px solid ${C.paperLine}` }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+                    <div style={{ fontSize: 12, fontWeight: 600, color: C.text }}>Last 6 months</div>
+                    <button onClick={() => exportPnlTrend(trend)} style={{ background: "transparent", border: `1px solid ${C.cardBorder}`, color: C.ink, borderRadius: 6, padding: "4px 10px", fontSize: 11, cursor: "pointer" }}>
+                      Export to Excel
+                    </button>
+                  </div>
+                  {trend.map((t) => (
+                    <div key={t.key} style={{ marginBottom: 8 }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: C.textMuted, marginBottom: 3 }}>
+                        <span>{t.label}</span>
+                        <span style={{ fontFamily: mono, color: t.net >= 0 ? C.green : C.red }}>
+                          {t.net < 0 ? "-" : ""}₹{Math.abs(Math.round(t.net)).toLocaleString("en-IN")}
+                        </span>
+                      </div>
+                      <div style={{ height: 5, background: C.paper, borderRadius: 2, overflow: "hidden" }}>
+                        <div style={{ width: `${Math.min(100, (t.revenue / trendMax) * 100)}%`, height: "100%", background: C.ink }} />
+                      </div>
+                      <div style={{ height: 5, background: C.paper, borderRadius: 2, overflow: "hidden", marginTop: 2 }}>
+                        <div style={{ width: `${Math.min(100, (t.expenses / trendMax) * 100)}%`, height: "100%", background: C.amber }} />
+                      </div>
+                    </div>
+                  ))}
+                  <div style={{ display: "flex", gap: 14, marginTop: 6, fontSize: 10.5, color: C.textMuted }}>
+                    <span><span style={{ display: "inline-block", width: 8, height: 8, background: C.ink, borderRadius: 2, marginRight: 4, verticalAlign: "middle" }} />Revenue</span>
+                    <span><span style={{ display: "inline-block", width: 8, height: 8, background: C.amber, borderRadius: 2, marginRight: 4, verticalAlign: "middle" }} />Expenses</span>
+                  </div>
+                </div>
               </div>
             </div>
           );
@@ -4128,6 +4882,71 @@ function ProductApp({ session, onLogout, setPage }) {
             <div style={{ fontSize: 13, color: C.textMuted, marginBottom: 18, lineHeight: 1.5 }}>
               Optional - not needed to scan bills or use your ledger. Fill this in if you want your business name and GSTIN to appear on your Excel exports and, later, on GST-ready reports.
             </div>
+
+            {businessLoaded && goalsLoaded && businessProfile && (() => {
+              const now = new Date();
+              const pKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+              const monthPnl = pnlForPeriod(entries, invoices, pKey);
+              const totalOutstanding = invoices.filter((inv) => inv.status !== "paid").reduce((s, inv) => s + (Number(inv.total) || 0), 0);
+              const ctx = {
+                cashBalance: businessProfile.cash_balance,
+                totalOutstanding,
+                monthRevenue: monthPnl.revenue,
+                monthExpenseRatio: monthPnl.revenue > 0 ? (monthPnl.expenses / monthPnl.revenue) * 100 : null,
+              };
+              return (
+                <div style={{ background: C.white, border: `1px solid ${C.cardBorder}`, borderRadius: 8, padding: "16px 18px", marginBottom: 18 }}>
+                  <div style={{ fontSize: 13.5, fontWeight: 600, color: C.text, marginBottom: 2 }}>AI Business Goals</div>
+                  <div style={{ fontSize: 11.5, color: C.textMuted, marginBottom: 12, lineHeight: 1.5 }}>
+                    Set a target, BahiSathi tracks it against numbers it already computes elsewhere.
+                  </div>
+
+                  {businessGoals.length > 0 && (
+                    <div style={{ marginBottom: 14 }}>
+                      {businessGoals.map((g) => {
+                        const gp = goalProgress(g, ctx);
+                        const barColor = gp.status === "met" ? C.green : gp.status === "behind" ? C.amber : C.textMuted;
+                        return (
+                          <div key={g.id} style={{ padding: "8px 0", borderBottom: `1px solid ${C.paperLine}` }}>
+                            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
+                              <span style={{ fontSize: 12.5, color: C.text, fontWeight: 500 }}>
+                                {gp.status === "met" ? "✓" : gp.status === "behind" ? "○" : "—"} {GOAL_TYPES[g.type].label}
+                              </span>
+                              <button onClick={() => deleteGoal(g.id)} style={{ background: "transparent", border: "none", color: C.red, fontSize: 11, cursor: "pointer", flexShrink: 0 }}>Remove</button>
+                            </div>
+                            <div style={{ fontSize: 11.5, color: C.textMuted, marginTop: 2 }}>{gp.label}</div>
+                            {gp.pct != null && (
+                              <div style={{ height: 5, background: C.paper, borderRadius: 2, overflow: "hidden", marginTop: 6 }}>
+                                <div style={{ width: `${gp.pct}%`, height: "100%", background: barColor }} />
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+
+                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+                    <select value={newGoalType} onChange={(e) => setNewGoalType(e.target.value)} style={{ border: `1px solid ${C.cardBorder}`, borderRadius: 6, padding: "8px 10px", fontSize: 12.5, background: C.white, color: C.text }}>
+                      {Object.entries(GOAL_TYPES).map(([key, t]) => (
+                        <option key={key} value={key}>{t.label}</option>
+                      ))}
+                    </select>
+                    <input
+                      type="number"
+                      value={newGoalValue}
+                      onChange={(e) => setNewGoalValue(e.target.value)}
+                      placeholder={GOAL_TYPES[newGoalType].unit === "%" ? "e.g. 18" : "e.g. 500000"}
+                      style={{ width: 130, border: `1px solid ${C.cardBorder}`, borderRadius: 6, padding: "8px 10px", fontSize: 12.5, background: C.white, color: C.text, outline: "none" }}
+                    />
+                    <button onClick={addGoal} disabled={savingGoal || !newGoalValue} style={{ background: C.gold, color: C.white, border: "none", borderRadius: 6, padding: "8px 16px", fontSize: 12.5, fontWeight: 500, cursor: savingGoal ? "default" : "pointer", opacity: savingGoal || !newGoalValue ? 0.7 : 1 }}>
+                      {savingGoal ? "Saving…" : "+ Add goal"}
+                    </button>
+                  </div>
+                  {goalsError && <div style={{ marginTop: 10, fontSize: 11.5, color: C.red }}>{goalsError}</div>}
+                </div>
+              );
+            })()}
 
             {!businessLoaded && <div style={{ fontSize: 13.5, color: C.textMuted }}>Loading…</div>}
 
@@ -4383,6 +5202,31 @@ function ProductApp({ session, onLogout, setPage }) {
                 {customers.length === 0 && (
                   <div style={{ fontSize: 13.5, color: C.textMuted, padding: "24px 0" }}>No customers yet - add one from a new invoice.</div>
                 )}
+
+                {(() => {
+                  const ranked = customerProfitabilityProxy();
+                  if (ranked.length < 2) return null;
+                  return (
+                    <div style={{ background: C.white, border: `1px solid ${C.cardBorder}`, borderRadius: 8, padding: "14px 16px", marginBottom: 16 }}>
+                      <div style={{ fontSize: 13, fontWeight: 600, color: C.text, marginBottom: 2 }}>Customer Profitability</div>
+                      <div style={{ fontSize: 11, color: C.textMuted, marginBottom: 10, lineHeight: 1.5 }}>
+                        Paid revenue adjusted for payment delay and at-risk balances - not true margin (BahiSathi doesn't track cost per sale yet), but a sales total alone can be misleading.
+                      </div>
+                      {ranked.slice(0, 6).map((r, i) => (
+                        <div key={r.customer.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "5px 0", borderBottom: i < Math.min(ranked.length, 6) - 1 ? `1px solid ${C.paperLine}` : "none" }}>
+                          <span style={{ fontSize: 12, color: C.text }}>{r.customer.name}</span>
+                          <span style={{ textAlign: "right" }}>
+                            <span style={{ fontFamily: mono, fontSize: 12, color: C.ink }}>₹{Math.round(r.effectiveValue).toLocaleString("en-IN")}</span>
+                            {(r.carryingCost + r.riskDiscount) > 0 && (
+                              <span style={{ fontSize: 10, color: C.textMuted }}> (of ₹{Math.round(r.paidRevenue).toLocaleString("en-IN")})</span>
+                            )}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  );
+                })()}
+
                 {customers.length > 0 && (
                   <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
                     {customers
@@ -4393,8 +5237,9 @@ function ProductApp({ session, onLogout, setPage }) {
                         const trendLabel = p.trend === "worse" ? "Getting worse ↓" : p.trend === "better" ? "Improving ↑" : "Steady";
                         const trendColor = p.trend === "worse" ? C.red : p.trend === "better" ? C.green : C.textMuted;
                         const phoneDigits = c.phone ? c.phone.replace(/\D/g, "") : null;
-                        const message = `Hi ${c.name}, this is a reminder from ${businessProfile?.business_name || "us"} - ₹${p.outstanding.toLocaleString("en-IN")} is currently outstanding. Could you please share an update on payment? Thank you!`;
-                        const waLink = phoneDigits ? `https://wa.me/${phoneDigits}?text=${encodeURIComponent(message)}` : null;
+                        const draft = followUpDraft(c, p, businessProfile?.business_name);
+                        const waLink = phoneDigits && draft ? `https://wa.me/${phoneDigits}?text=${encodeURIComponent(draft.message)}` : null;
+                        const tierColor = draft ? { friendly: C.green, reminder: C.textMuted, overdue: C.amber, final: C.red }[draft.tier] : C.textMuted;
                         const trust = trustScoreFor(p);
                         return (
                           <div key={c.id} style={{ background: C.white, border: `1px solid ${C.cardBorder}`, borderRadius: 8, padding: "14px 16px" }}>
@@ -4422,18 +5267,24 @@ function ProductApp({ session, onLogout, setPage }) {
                                 </div>
                               </div>
                             </div>
-                            {p.unpaidCount > 0 && (
-                              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 10, paddingTop: 10, borderTop: `1px solid ${C.paperLine}` }}>
-                                <div style={{ fontSize: 11.5, color: p.maxOverdueDays > 30 ? C.red : C.textMuted }}>
-                                  Oldest unpaid invoice: {p.maxOverdueDays} day{p.maxOverdueDays === 1 ? "" : "s"} ago
+                            {p.unpaidCount > 0 && draft && (
+                              <div style={{ marginTop: 10, paddingTop: 10, borderTop: `1px solid ${C.paperLine}` }}>
+                                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+                                  <div style={{ fontSize: 11.5, color: p.maxOverdueDays > 30 ? C.red : C.textMuted, display: "flex", alignItems: "center", gap: 6 }}>
+                                    Oldest unpaid invoice: {p.maxOverdueDays} day{p.maxOverdueDays === 1 ? "" : "s"} ago
+                                    <span style={{ fontSize: 10, fontWeight: 600, color: C.white, background: tierColor, borderRadius: 10, padding: "2px 8px" }}>{draft.tierLabel}</span>
+                                  </div>
+                                  {waLink ? (
+                                    <a href={waLink} target="_blank" rel="noopener noreferrer" style={{ background: "#128C7E", color: C.white, borderRadius: 6, padding: "6px 12px", fontSize: 12, fontWeight: 500, textDecoration: "none" }}>
+                                      Send WhatsApp reminder
+                                    </a>
+                                  ) : (
+                                    <span style={{ fontSize: 11, color: C.textMuted }}>Add a phone number to send reminders</span>
+                                  )}
                                 </div>
-                                {waLink ? (
-                                  <a href={waLink} target="_blank" rel="noopener noreferrer" style={{ background: "#128C7E", color: C.white, borderRadius: 6, padding: "6px 12px", fontSize: 12, fontWeight: 500, textDecoration: "none" }}>
-                                    Send WhatsApp reminder
-                                  </a>
-                                ) : (
-                                  <span style={{ fontSize: 11, color: C.textMuted }}>Add a phone number to send reminders</span>
-                                )}
+                                <div style={{ fontSize: 11.5, color: C.textMuted, marginTop: 8, background: C.paper, borderRadius: 6, padding: "8px 10px", lineHeight: 1.5, fontStyle: "italic" }}>
+                                  "{draft.message}"
+                                </div>
                               </div>
                             )}
                             <div style={{ marginTop: 10, paddingTop: 10, borderTop: `1px solid ${C.paperLine}` }}>
@@ -4707,6 +5558,26 @@ function ProductApp({ session, onLogout, setPage }) {
               Compare the cash you actually counted against what BahiSathi expects from invoices marked "Paid by Cash" that day.
             </div>
 
+            {(() => {
+              const missing = missingMoneyFindings(invoices, bankTransactions, dailyClosings);
+              if (missing.length === 0) return null;
+              const sevDot = (s) => (s === "high" ? "🔴" : s === "medium" ? "🟡" : "⚪️");
+              return (
+                <div style={{ background: C.white, border: `1px solid ${C.cardBorder}`, borderRadius: 8, padding: "16px 18px", marginBottom: 16 }}>
+                  <div style={{ fontSize: 13.5, fontWeight: 600, color: C.text, marginBottom: 2 }}>Missing Money Detector</div>
+                  <div style={{ fontSize: 11.5, color: C.textMuted, marginBottom: 10, lineHeight: 1.5 }}>
+                    Invoices marked paid with no independent trace elsewhere BahiSathi tracks - a matched bank/UPI transaction, or a same-day evening closing for cash sales.
+                  </div>
+                  {missing.map((f, i) => (
+                    <div key={i} style={{ padding: "8px 0", borderBottom: i < missing.length - 1 ? `1px solid ${C.paperLine}` : "none" }}>
+                      <div style={{ fontSize: 13, fontWeight: 500, color: C.text }}>{sevDot(f.severity)} {f.label}</div>
+                      <div style={{ fontSize: 11.5, color: C.textMuted, marginTop: 2 }}>{f.hint}</div>
+                    </div>
+                  ))}
+                </div>
+              );
+            })()}
+
             <div style={{ marginBottom: 16 }}>
               <div style={{ fontSize: 12, color: C.textMuted, marginBottom: 5 }}>Date</div>
               <input
@@ -4912,6 +5783,51 @@ function ProductApp({ session, onLogout, setPage }) {
                       <div style={{ fontSize: 11.5, color: C.textMuted, marginTop: 2 }}>{f.hint}</div>
                     </div>
                   ))
+                )}
+              </div>
+
+              <div style={{ background: C.white, border: `1px solid ${C.cardBorder}`, borderRadius: 8, padding: "16px 18px", marginTop: 16 }}>
+                <div style={{ fontSize: 13.5, fontWeight: 600, color: C.text, marginBottom: 2 }}>Audit Trail</div>
+                <div style={{ fontSize: 11.5, color: C.textMuted, marginBottom: 10, lineHeight: 1.5 }}>
+                  Every edit, delete, and payment-status change to your bills and invoices, with what changed and a one-click restore - persists across sessions, unlike a browser undo.
+                </div>
+                {!auditLogLoaded ? (
+                  <div style={{ fontSize: 12.5, color: C.textMuted }}>Loading…</div>
+                ) : auditLog.length === 0 ? (
+                  <div style={{ fontSize: 12.5, color: C.textMuted }}>No changes logged yet - edits, deletes, and payment-status changes will show up here.</div>
+                ) : (
+                  auditLog.map((u, i) => {
+                    const diffLines = auditDiffLines(u);
+                    return (
+                      <div key={u.id} style={{ padding: "8px 0", borderBottom: i < auditLog.length - 1 ? `1px solid ${C.paperLine}` : "none" }}>
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10, flexWrap: "wrap" }}>
+                          <div>
+                            <div style={{ fontSize: 13, fontWeight: 500, color: C.text }}>{u.summary}</div>
+                            <div style={{ fontSize: 11, color: C.textMuted, marginTop: 2 }}>
+                              {new Date(u.created_at).toLocaleString("en-IN", { day: "numeric", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" })}
+                              {diffLines.length > 0 && (
+                                <button onClick={() => setExpandedLogId(expandedLogId === u.id ? null : u.id)} style={{ marginLeft: 8, background: "transparent", border: "none", color: C.ink, textDecoration: "underline", fontSize: 11, cursor: "pointer", padding: 0, fontFamily: sans }}>
+                                  {expandedLogId === u.id ? "Hide changes" : "View changes"}
+                                </button>
+                              )}
+                            </div>
+                          </div>
+                          {u.before && (
+                            <button onClick={() => restoreAuditEntry(u)} disabled={restoringLogId === u.id} style={{ background: "transparent", border: `1px solid ${C.cardBorder}`, color: C.ink, borderRadius: 16, padding: "4px 10px", fontSize: 11, cursor: restoringLogId === u.id ? "default" : "pointer", flexShrink: 0 }}>
+                              {restoringLogId === u.id ? "Restoring…" : "Restore"}
+                            </button>
+                          )}
+                        </div>
+                        {expandedLogId === u.id && diffLines.length > 0 && (
+                          <div style={{ marginTop: 6, background: C.paper, borderRadius: 4, padding: "8px 10px" }}>
+                            {diffLines.map((line, li) => (
+                              <div key={li} style={{ fontSize: 11.5, color: C.text, fontFamily: mono }}>{line}</div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })
                 )}
               </div>
             </div>
